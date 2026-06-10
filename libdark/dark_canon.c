@@ -12,6 +12,34 @@
 #include "dark_common.h"
 
 
+/*
+ * Locate the value region of the "b=" tag with tag-boundary awareness.
+ * Returns a pointer to the first character after "b=", or NULL.
+ *
+ * A match requires the 'b' to be at the start of the string or preceded
+ * by ';' / SP / TAB, and to be immediately followed by '='.  This avoids
+ * matching "bh=" or a "b=" sequence that happens to occur inside another
+ * tag's value (the old strstr("b=") with a single *(p-1)=='h' guard could
+ * zero out the wrong region).
+ */
+static char *dc_find_b_value(char *s)
+{
+   for (char *p = s; *p; p++)
+   {
+      if (p[0] != 'b' || p[1] != '=')
+         continue;
+      if (p != s)
+      {
+         char prev = p[-1];
+         if (prev != ';' && prev != ' ' && prev != '\t')
+            continue;
+      }
+      return p + 2;
+   }
+   return NULL;
+}
+
+
 int canonicalize_header_relaxed(const char *name, const char *value,
                                 char *out, size_t out_max, int add_crlf)
 {
@@ -110,22 +138,10 @@ int canonicalize_sig_for_verify(const char *name, const char *value,
 
    unfold_header(buf);
 
-   char *p = buf;
-   while (*p)
+   char *val_start = dc_find_b_value(buf);
+   if (val_start)
    {
-      char *found = strstr(p, "b=");
-      if (!found) break;
-
-      /* Guard against matching bh= */
-      if (found > buf && *(found - 1) == 'h')
-      {
-         p = found + 2;
-         continue;
-      }
-
-      char *val_start = found + 2;
       char *val_end = val_start;
-
       while (*val_end && *val_end != ';' && *val_end != '\r' && *val_end != '\n')
          val_end++;
 
@@ -133,20 +149,17 @@ int canonicalize_sig_for_verify(const char *name, const char *value,
          memmove(val_start, val_end, strlen(val_end) + 1);
       else
          *val_start = '\0';
-
-      break;
    }
+
    return canonicalize_header_relaxed(name, buf, out, out_max, 0);
 }
 
 void prepare_header_for_hash(char *header_val)
 {
-   char *p_start = strcasestr(header_val, "b=");
-   if (!p_start) return;
+   char *p_value = dc_find_b_value(header_val);
+   if (!p_value) return;
 
-   char *p_value = p_start + 2;
    char *p_end = p_value;
-
    while (*p_end && *p_end != ';' && *p_end != '\r' && *p_end != '\n')
       p_end++;
 

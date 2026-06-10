@@ -94,6 +94,11 @@ int  dc_get_tag_int(const char *header_value, const char *tag);
 void dc_get_tag_str(const char *header_value, const char *tag,
                     char *out, size_t out_len);
 
+/* Highest i= among DKIM2-Signature headers only (0 if none, -1 on a
+ * chain gap).  Authoritative source for the next signing hop index,
+ * grounded in the spec's contiguous-chain rule. */
+int  dc_max_sig_hop(const struct header_slot *headers, int header_cnt);
+
 /* ================================================================
  * ENVELOPE UTILITIES — dc_shared.c
  * ================================================================ */

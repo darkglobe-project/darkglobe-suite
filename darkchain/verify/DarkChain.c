@@ -129,6 +129,11 @@ struct context
 
    /* --- DoS: total bytes of DKIM2-specific headers (128KB cap) --- */
    size_t dkim2_header_bytes;
+
+   /* --- Rollback scratch (DC_MAX_SEQ slots) — allocated once per
+    *     connection in dc_connect(), reused for every message, freed in
+    *     dc_close().  Keeps ~128KB off the stack of dc_rollback_hh(). --- */
+   struct header_slot *rb_scratch;
 };
 
 
@@ -308,9 +313,11 @@ static int dc_check_dns_key_hash(const char *d, const char *s, const char *sig_a
  *
  * Returns malloc'd base64 string, or NULL on error. Caller frees.
  */
-static char *dc_rollback_hh(struct header_slot *headers, int header_cnt, int hop)
+static char *dc_rollback_hh(struct header_slot *headers, int header_cnt, int hop,
+                            struct header_slot *rb_scratch)
 {
-   struct header_slot *work[MAX_HEADER_COUNT];
+   /* Off-stack: one instance per worker thread. */
+   static __thread struct header_slot *work[MAX_HEADER_COUNT];
    int work_cnt = 0;
 
    for (int j = 0; j < header_cnt && work_cnt < MAX_HEADER_COUNT; j++)
@@ -329,9 +336,10 @@ static char *dc_rollback_hh(struct header_slot *headers, int header_cnt, int hop
             max_seq = headers[j].seq;
    }
 
-   struct header_slot rb_slots[DC_MAX_SEQ];
+   struct header_slot *rb_slots = rb_scratch;
    int rb_count = 0;
-   memset(rb_slots, 0, sizeof(rb_slots));
+   if (!rb_slots) return NULL;
+   memset(rb_slots, 0, DC_MAX_SEQ * sizeof(struct header_slot));
 
    /* Process in REVERSE seq= order */
    for (int seq = max_seq; seq >= 1; seq--)
@@ -494,7 +502,7 @@ static char *dc_rollback_hh(struct header_slot *headers, int header_cnt, int hop
 
       if (grp_end - grp_start > 1)
       {
-         int sort_keys[MAX_HEADER_COUNT];
+         static __thread int sort_keys[MAX_HEADER_COUNT];
          for (int g = grp_start; g < grp_end; g++)
          {
             sort_keys[g] = 0;
@@ -610,6 +618,19 @@ static sfsistat dc_connect(SMFICTX *ctx, char *hostname, _SOCK_ADDR *hostaddr)
    ps->envelope.rcpt_capacity = DC_RCPT_INITIAL;
    ps->envelope.rcpt_count = 0;
    ps->envelope.rcpt_to = calloc(DC_RCPT_INITIAL, DC_MAX_ADDR);
+
+   /* Rollback scratch — allocated once for the connection, reused per
+    * message, freed in dc_close().  Keeps a ~128KB buffer off the stack. */
+   ps->rb_scratch = calloc(DC_MAX_SEQ, sizeof(struct header_slot));
+   if (ps->rb_scratch == NULL)
+   {
+      free(ps->headers);
+      free(ps->envelope.rcpt_to);
+      EVP_MD_CTX_free(ps->mdctx_header);
+      EVP_MD_CTX_free(ps->mdctx_body);
+      free(ps);
+      return SMFIS_TEMPFAIL;
+   }
 
    ps->is_localhost = 0;
    ps->msg_count = 0;
@@ -1520,11 +1541,11 @@ static sfsistat dc_eom(SMFICTX *ctx)
 
       char *ed_buf = NULL;
       char *ed_ptr = NULL;
+      size_t buf_est = (size_t)(ps->header_cnt + 10) *
+                       (BIG_HEADER_VALUE + MAX_HEADER_NAME + 64);
 
       if (is_ed25519)
       {
-         size_t buf_est = (size_t)(ps->header_cnt + 10) *
-                          (BIG_HEADER_VALUE + MAX_HEADER_NAME + 64);
          ed_buf = calloc(1, buf_est);
          if (!ed_buf)
          {
@@ -1540,13 +1561,21 @@ static sfsistat dc_eom(SMFICTX *ctx)
          EVP_DigestInit_ex(ps->mdctx_header, EVP_sha256(), NULL);
       }
 
-      #define FEED_DATA(data, len) do {                         \
-         if (is_ed25519) {                                      \
-            memcpy(ed_ptr, (data), (len));                      \
-            ed_ptr += (len);                                    \
-         } else {                                               \
-            EVP_DigestUpdate(ps->mdctx_header, (data), (len));  \
-         }                                                      \
+      #define FEED_DATA(data, len) do {                                        \
+         if (is_ed25519) {                                                     \
+            if ((size_t)(ed_ptr - ed_buf) + (size_t)(len) > buf_est) {         \
+               syslog(LOG_ERR, "DC_EOM: ed25519 header buffer overflow guard"); \
+               free(ed_buf); ed_buf = NULL;                                    \
+               dkim2_verdict = "temperror";                                    \
+               snprintf(dkim2_details, sizeof(dkim2_details),                  \
+                        "header buffer overflow i=%d", ps->max_hop);           \
+               goto cleanup_key;                                               \
+            }                                                                  \
+            memcpy(ed_ptr, (data), (len));                                     \
+            ed_ptr += (len);                                                   \
+         } else {                                                              \
+            EVP_DigestUpdate(ps->mdctx_header, (data), (len));                 \
+         }                                                                     \
       } while(0)
 
       #define FEED_HEADER_SLOT(slot, with_crlf) do {            \
@@ -1605,10 +1634,18 @@ static sfsistat dc_eom(SMFICTX *ctx)
          size_t total_len = (size_t)(ed_ptr - ed_buf);
 
          EVP_MD_CTX *ed_ctx = EVP_MD_CTX_new();
-         EVP_DigestVerifyInit(ed_ctx, NULL, NULL, NULL, pubkey);
-         int result = EVP_DigestVerify(ed_ctx, sig_binary, sig_bin_len,
-                                        (unsigned char *)ed_buf, total_len);
-         EVP_MD_CTX_free(ed_ctx);
+         int result = 0;
+         if (ed_ctx &&
+             EVP_DigestVerifyInit(ed_ctx, NULL, NULL, NULL, pubkey) == 1)
+         {
+            result = EVP_DigestVerify(ed_ctx, sig_binary, sig_bin_len,
+                                      (unsigned char *)ed_buf, total_len);
+         }
+         else
+         {
+            syslog(LOG_ERR, "DC_EOM: EVP_DigestVerifyInit (ed25519) failed");
+         }
+         if (ed_ctx) EVP_MD_CTX_free(ed_ctx);
          free(ed_buf);
          ed_buf = NULL;
 
@@ -1625,17 +1662,21 @@ static sfsistat dc_eom(SMFICTX *ctx)
          }
 
          EVP_PKEY_CTX *ver_ctx = EVP_PKEY_CTX_new(pubkey, NULL);
-         if (ver_ctx)
+         if (ver_ctx &&
+             EVP_PKEY_verify_init(ver_ctx) == 1 &&
+             EVP_PKEY_CTX_set_rsa_padding(ver_ctx, RSA_PKCS1_PADDING) > 0 &&
+             EVP_PKEY_CTX_set_signature_md(ver_ctx, EVP_sha256()) > 0)
          {
-            EVP_PKEY_verify_init(ver_ctx);
-            EVP_PKEY_CTX_set_rsa_padding(ver_ctx, RSA_PKCS1_PADDING);
-            EVP_PKEY_CTX_set_signature_md(ver_ctx, EVP_sha256());
-
             int result = EVP_PKEY_verify(ver_ctx, sig_binary, sig_bin_len,
                                           m_hash, m_hash_len);
             ps->header_vfy = (result == 1) ? 1 : 0;
-            EVP_PKEY_CTX_free(ver_ctx);
          }
+         else
+         {
+            syslog(LOG_ERR, "DC_EOM: RSA verify context init failed");
+            ps->header_vfy = 0;
+         }
+         if (ver_ctx) EVP_PKEY_CTX_free(ver_ctx);
       }
 
       #undef FEED_DATA
@@ -1716,7 +1757,8 @@ static sfsistat dc_eom(SMFICTX *ctx)
 
       if (prev_hh[0] != '\0')
       {
-         char *rolled_hh = dc_rollback_hh(ps->headers, ps->header_cnt, ps->max_hop);
+         char *rolled_hh = dc_rollback_hh(ps->headers, ps->header_cnt, ps->max_hop,
+                                          ps->rb_scratch);
          if (rolled_hh)
          {
             if (strcmp(prev_hh, rolled_hh) == 0)
@@ -1913,6 +1955,11 @@ static sfsistat dc_close(SMFICTX *ctx)
    if (ps != NULL)
    {
       dc_cleanup_message(ps);
+      if (ps->rb_scratch)
+      {
+         free(ps->rb_scratch);
+         ps->rb_scratch = NULL;
+      }
       smfi_setpriv(ctx, NULL);
       free(ps);
    }

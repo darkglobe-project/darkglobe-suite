@@ -37,6 +37,8 @@
 
 #include "../dc_shared.h"
 #include <netdb.h>
+#include <stdint.h>
+#include <openssl/hmac.h>
 
 /* ================================================================
  * CONFIGURATION
@@ -54,6 +56,12 @@
 
 #define DC_DOMAINS_CONF "/etc/DarkChains/domains.conf"
 #define DC_MAX_DOMAINS  32
+
+/* Optional SRS secret for forward-path rewrite forge-resistance.
+ * If the file is absent, SRS addresses are still well-formed and routable
+ * but carry no cryptographic forge-resistance (acceptable when inbound
+ * bounce SRS is not validated). */
+#define DC_SRS_KEY_CONF "/etc/DarkChains/srs.key"
 
 /* h= fields — message headers only, never DKIM2-* */
 #define H_FIELDS        "from:to:subject:date:message-id"
@@ -125,6 +133,55 @@ static int default_dk_loaded = 0;
 const char *pc_oconn = OCONN;
 const char *pc_user  = USER;
 char  my_hostname[256] = "";
+
+
+/* ================================================================
+ * SRS (forward-path rewrite) — canonical SRS0 form
+ * ================================================================ */
+
+static unsigned char srs_secret[256];
+static size_t        srs_secret_len = 0;
+
+/* RFC 4648 base32 alphabet, address-safe (no '=' which is the SRS sep) */
+static const char SRS_B32[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+static void load_srs_secret(const char *path)
+{
+   FILE *fp = fopen(path, "r");
+   if (!fp)
+   {
+      syslog(LOG_INFO,
+             "DCS_MAIN: no SRS key at %s — SRS forge-resistance disabled", path);
+      return;
+   }
+   size_t n = fread(srs_secret, 1, sizeof(srs_secret), fp);
+   fclose(fp);
+   while (n > 0 && (srs_secret[n - 1] == '\n' || srs_secret[n - 1] == '\r' ||
+                    srs_secret[n - 1] == ' '  || srs_secret[n - 1] == '\t'))
+      n--;
+   srs_secret_len = n;
+   syslog(LOG_INFO, "DCS_MAIN: loaded SRS key (%zu bytes)", srs_secret_len);
+}
+
+/* Emit out_chars base32 symbols from the bit stream of in[] */
+static void srs_base32(const unsigned char *in, size_t inlen,
+                       char *out, size_t out_chars)
+{
+   size_t bits = 0, oi = 0;
+   uint32_t buf = 0;
+   for (size_t i = 0; i < inlen && oi < out_chars; i++)
+   {
+      buf = (buf << 8) | in[i];
+      bits += 8;
+      while (bits >= 5 && oi < out_chars)
+      {
+         bits -= 5;
+         out[oi++] = SRS_B32[(buf >> bits) & 0x1f];
+      }
+   }
+   while (oi < out_chars) out[oi++] = SRS_B32[0];
+   out[oi] = '\0';
+}
 
 
 /* ================================================================
@@ -639,40 +696,88 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    else if (ps->next_hop == 0 && ps->is_localhost == 1 && ps->max_prev_hop > 0)
    {
       /* Case B: local mailing list signing after DKIM-Mod.
-       * N = found_prev_sigs + 1 (count of DKIM2-Signatures, not Mods).
-       * Verdict: propagate from the most recent DKIM2-Authentication-Results.
+       * N = (highest DKIM2-Signature i=) + 1.  We derive this from
+       * dc_max_sig_hop() — the authoritative signature-only index — rather
+       * than from found_prev_sigs (a count) or max_prev_hop (a max over
+       * signatures AND Mods, which sits at N when the list's Mod is present).
+       * The verifier's chain-continuity check did not run on this post-list
+       * path, so dc_max_sig_hop() does its own lightweight contiguity pass
+       * and returns -1 on a gap; per the spec a gap means the chain is
+       * unsigned, so we do not add a signature certifying a broken chain.
        */
-      N = ps->found_prev_sigs + 1;
+      int max_sig = dc_max_sig_hop(ps->headers, ps->header_cnt);
+      if (max_sig < 0)
+      {
+         syslog(LOG_NOTICE,
+                "DCS_EOM: Case B — broken DKIM2-Signature chain; not signing");
+         return SMFIS_CONTINUE;
+      }
+      N = max_sig + 1;
       generate_auth_result = 1;
 
-      /* Find the DKIM2-Authentication-Results with highest i= */
-      const char *prev_verdict = "pass";
-      int prev_max_i = 0;
+      /* Verdict: propagate from the DKIM2-Authentication-Results of the
+       * PREVIOUS hop, i.e. at i = N-1.  In Case B the prior AR was emitted
+       * by the pre-list signer at its own signing level (N-1); the list
+       * manager then added a DKIM2-Mod at level N.  The anchor must be N-1,
+       * NOT max_prev_hop (which equals N when that Mod is present) and NOT
+       * the highest i= among AR records (an unsigned, injectable field).
+       * N-1 derives from found_prev_sigs (signed chain), so a peer cannot
+       * hijack selection by injecting an AR at an arbitrary i=.
+       *
+       *   - no AR at N-1            -> "none"   (legitimate in transition:
+       *                                          a prior hop may not emit AR)
+       *   - all AR at N-1 agree     -> that verdict
+       *   - AR at N-1 disagree      -> "fail"   (chain error or injection;
+       *                                          must not propagate a good verdict)
+       *
+       * "Disagreement" means differing dkim2= values at the same level.
+       * Duplicate identical verdicts are not a disagreement.
+       */
+      const int prev_hop = N - 1;
+      const char *prev_verdict = NULL;   /* NULL == not seen yet */
+      int verdict_conflict = 0;
+      int ar_seen = 0;
+
       for (int j = 0; j < ps->header_cnt; j++)
       {
          if (strcasecmp(ps->headers[j].name,
-                        "DKIM2-Authentication-Results") == 0)
+                        "DKIM2-Authentication-Results") != 0)
+            continue;
+
+         if (dc_get_hop_index(ps->headers[j].value) != prev_hop)
+            continue;
+
+         ar_seen++;
+
+         /* Normalize this record's dkim2= to a canonical verdict.
+          * AR present for this hop but no/unrecognized dkim2= -> "none".
+          */
+         const char *v = "none";
+         const char *dv = dc_find_tag(ps->headers[j].value, "dkim2");
+         if (dv)
          {
-            int ar_i = dc_get_hop_index(ps->headers[j].value);
-            if (ar_i > prev_max_i)
-            {
-               prev_max_i = ar_i;
-               const char *dv = dc_find_tag(ps->headers[j].value, "dkim2");
-               if (dv)
-               {
-                  if (strncasecmp(dv, "fail", 4) == 0)
-                     prev_verdict = "fail";
-                  else if (strncasecmp(dv, "temperror", 9) == 0)
-                     prev_verdict = "temperror";
-                  else if (strncasecmp(dv, "permerror", 9) == 0)
-                     prev_verdict = "permerror";
-                  else if (strncasecmp(dv, "none", 4) == 0)
-                     prev_verdict = "none";
-                  else
-                     prev_verdict = "pass";
-               }
-            }
+            if (strncasecmp(dv, "fail", 4) == 0)           v = "fail";
+            else if (strncasecmp(dv, "temperror", 9) == 0) v = "temperror";
+            else if (strncasecmp(dv, "permerror", 9) == 0) v = "permerror";
+            else if (strncasecmp(dv, "none", 4) == 0)      v = "none";
+            else if (strncasecmp(dv, "pass", 4) == 0)      v = "pass";
+            else                                           v = "none";
          }
+
+         if (prev_verdict == NULL)
+            prev_verdict = v;
+         else if (strcmp(prev_verdict, v) != 0)
+            verdict_conflict = 1;
+      }
+
+      if (ar_seen == 0)
+         prev_verdict = "none";
+      else if (verdict_conflict)
+      {
+         syslog(LOG_NOTICE,
+                "DCS_EOM: Case B — conflicting DKIM2-Auth-Results at i=%d; "
+                "propagating fail", prev_hop);
+         prev_verdict = "fail";
       }
 
       snprintf(auth_result_value, sizeof(auth_result_value),
@@ -747,28 +852,42 @@ static sfsistat dcs_eom(SMFICTX *ctx)
             localpart[lp_len] = '\0';
          }
 
-         /* Build SRS-like address */
-         unsigned int ts_short = (unsigned int)(time(NULL) / 86400) & 0xFFFF;
+         /* Canonical SRS0 forward-path rewrite:
+          *   SRS0=HHH=TT=origdomain=localpart@signing_domain
+          *
+          * TT  = days-since-epoch mod 1024, 2 base32 chars.
+          * HHH = HMAC-SHA1(secret, TT || origdomain || localpart) truncated
+          *       to 4 base32 chars.  With no configured secret the HMAC key
+          *       is empty: the address stays well-formed and routable but
+          *       carries no forge-resistance (fine when inbound bounce SRS
+          *       is not cryptographically validated). */
+         unsigned int days = (unsigned int)(time(NULL) / 86400) % 1024;
+         char tt[3];
+         tt[0] = SRS_B32[(days >> 5) & 0x1f];
+         tt[1] = SRS_B32[days & 0x1f];
+         tt[2] = '\0';
 
-         /* Simple hash: first 6 chars of SHA-256(localpart=origdomain=secret) */
-         char hash_input[DC_MAX_ADDR * 2];
-         snprintf(hash_input, sizeof(hash_input), "%s=%s=%u",
-                  localpart, mf_domain, ts_short);
-         unsigned char hash_bin[32];
-         EVP_MD_CTX *hctx = EVP_MD_CTX_new();
-         EVP_DigestInit_ex(hctx, EVP_sha256(), NULL);
-         EVP_DigestUpdate(hctx, hash_input, strlen(hash_input));
-         EVP_DigestFinal_ex(hctx, hash_bin, NULL);
-         EVP_MD_CTX_free(hctx);
+         char mac_input[DC_MAX_ADDR * 2];
+         int mac_in_len = snprintf(mac_input, sizeof(mac_input), "%s%s%s",
+                                   tt, mf_domain, localpart);
+         if (mac_in_len < 0) mac_in_len = 0;
+         if (mac_in_len > (int)sizeof(mac_input) - 1)
+            mac_in_len = (int)sizeof(mac_input) - 1;
 
-         char hash_hex[7];
-         snprintf(hash_hex, sizeof(hash_hex), "%02x%02x%02x",
-                  hash_bin[0], hash_bin[1], hash_bin[2]);
+         unsigned char mac[EVP_MAX_MD_SIZE];
+         unsigned int  mac_len = 0;
+         char hhh[5] = "AAAA";
+         if (HMAC(EVP_sha1(), srs_secret, (int)srs_secret_len,
+                  (unsigned char *)mac_input, (size_t)mac_in_len,
+                  mac, &mac_len))
+         {
+            srs_base32(mac, mac_len, hhh, 4);
+         }
 
          char new_mailfrom[1024];
          snprintf(new_mailfrom, sizeof(new_mailfrom),
-                  "SRS0=%s=%04x=%s=%s@%s",
-                  hash_hex, ts_short, mf_domain, localpart, dk->domain);
+                  "SRS0=%s=%s=%s=%s@%s",
+                  hhh, tt, mf_domain, localpart, dk->domain);
 
          syslog(LOG_INFO, "DCS_EOM: Relay rewriting MAIL FROM: '%s' -> '%s'",
                 ps->envelope.mail_from, new_mailfrom);
@@ -908,10 +1027,18 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    char *bp = sign_buf;
    char canon_buf[BIG_HEADER_VALUE + MAX_HEADER_NAME + 64];
 
-   #define APPEND_CANON(hname, hvalue, crlf) do {                       \
-      int _cl = canonicalize_header_relaxed((hname), (hvalue),          \
-                canon_buf, sizeof(canon_buf), (crlf));                  \
-      if (_cl > 0) { memcpy(bp, canon_buf, _cl); bp += _cl; }          \
+   #define APPEND_CANON(hname, hvalue, crlf) do {                          \
+      int _cl = canonicalize_header_relaxed((hname), (hvalue),             \
+                canon_buf, sizeof(canon_buf), (crlf));                     \
+      if (_cl > 0) {                                                       \
+         if ((size_t)(bp - sign_buf) + (size_t)_cl > buf_est) {            \
+            syslog(LOG_ERR, "DCS_EOM: sign buffer overflow guard");        \
+            free(sign_buf); free(bh_b64); free(hh_b64);                    \
+            if (rt_values) free(rt_values);                                \
+            return SMFIS_TEMPFAIL;                                         \
+         }                                                                 \
+         memcpy(bp, canon_buf, _cl); bp += _cl;                            \
+      }                                                                    \
    } while(0)
 
    /* a) Previous DKIM2-Signatures i=1..N-1 ascending */
@@ -1041,7 +1168,7 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    }
 
    char xsigned[100] = "";
-   snprintf (xsigned, sizeof(xsigned), "DarkChain 0.1 i=%d", N);
+   snprintf (xsigned, sizeof(xsigned), "DarkChain 0.2 i=%d", N);
    smfi_addheader(ctx, "X-Signed", xsigned);
 
    /* Timing */
@@ -1203,6 +1330,9 @@ int main(int argc, char *argv[])
 
    /* Load header hash exclusion patterns */
    load_hh_excludes(DC_HH_EXCLUDE_CONF);
+
+   /* Load optional SRS secret (forward-path forge-resistance) */
+   load_srs_secret(DC_SRS_KEY_CONF);
 
    if (pc_ofile) unlink(pc_ofile);
 

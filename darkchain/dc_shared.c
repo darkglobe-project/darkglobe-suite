@@ -100,6 +100,57 @@ int dc_get_hop_index(const char *header_value)
 }
 
 /*
+ * Highest i= among DKIM2-Signature headers only.
+ *
+ * Per the deployment profile, DKIM2-Signature headers are numbered
+ * sequentially starting at i=1 and a gap MUST be treated as making the
+ * message unsigned.  Given that rule, the highest signature index equals
+ * the signature count, and (highest + 1) is the authoritative index for
+ * the next signing hop — independent of any DKIM2-Mod present (which may
+ * sit at the next level and would inflate a max taken over all headers).
+ *
+ * The inbound verifier already validates chain continuity in dc_eoh; this
+ * function carries its own lightweight contiguity pass because it is also
+ * called by the outbound signer in the post-list (Case B) path, where the
+ * verifier did not run.  On a gap it logs and returns -1 so the caller can
+ * treat the chain as unsigned.  Returns 0 when no DKIM2-Signature exists.
+ *
+ * Reads the already-parsed dc_type/hop fields directly — no re-parsing.
+ */
+int dc_max_sig_hop(const struct header_slot *headers, int header_cnt)
+{
+   int max_i = 0;
+   for (int j = 0; j < header_cnt; j++)
+   {
+      if (headers[j].dc_type == DC_HDR_SIG && headers[j].hop > max_i)
+         max_i = headers[j].hop;
+   }
+   if (max_i == 0)
+      return 0;
+
+   for (int i = 1; i <= max_i; i++)
+   {
+      int found = 0;
+      for (int j = 0; j < header_cnt; j++)
+      {
+         if (headers[j].dc_type == DC_HDR_SIG && headers[j].hop == i)
+         {
+            found = 1;
+            break;
+         }
+      }
+      if (!found)
+      {
+         syslog(LOG_NOTICE,
+                "dc_max_sig_hop: chain gap — no DKIM2-Signature at i=%d "
+                "(max=%d); treating chain as unsigned", i, max_i);
+         return -1;
+      }
+   }
+   return max_i;
+}
+
+/*
  * Extract an integer tag value (v=, seq=, fr=) from a DKIM2 header.
  * Returns the integer value, or 0 if not found.
  */
@@ -520,7 +571,10 @@ int cmp_rt_by_v(const void *a, const void *b)
  */
 char *dc_compute_hh(struct header_slot *headers, int header_cnt)
 {
-   struct header_slot *ptrs[MAX_HEADER_COUNT];
+   /* Off-stack: one instance per worker thread (libmilter = 1 thread per
+    * connection), so no locking is required and the ~10KB stays out of the
+    * call frame. */
+   static __thread struct header_slot *ptrs[MAX_HEADER_COUNT];
    int count = 0;
 
    for (int j = 0; j < header_cnt && count < MAX_HEADER_COUNT; j++)
@@ -547,7 +601,7 @@ char *dc_compute_hh(struct header_slot *headers, int header_cnt)
       if (grp_size > 1)
       {
          /* Step A: For ALL members, try to find a matching DKIM2-Mod (new=) */
-         int sort_keys[MAX_HEADER_COUNT];
+         static __thread int sort_keys[MAX_HEADER_COUNT];
 
          for (int g = grp_start; g < grp_end; g++)
          {
