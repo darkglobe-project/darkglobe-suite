@@ -11,12 +11,6 @@ A suite of milter components for email authentication and content filtering, dep
 | [DarkChain](darkchain/) | DKIM2-core verifier and signer | Apache 2.0 |
 | [DarkARC](darkarc/) | ARC verifier and signer (RFC 8617) | PolyForm Noncommercial 1.0.0 |
 
-### Content filtering
-
-| Component | Function | License |
-|-----------|----------|---------|
-| DarkSpam | Spam and content filtering | PolyForm Noncommercial 1.0.0 |
-
 ## Shared library
 
 [libDark](libdark/) provides common utilities, canonicalization, cryptographic primitives and string handling used by all components. Released under the MIT License.
@@ -27,7 +21,7 @@ All components follow the same principles: C implementation, standard milter API
 
 ## Status
 
-DarkChain and DarkARC are in active beta on production mail infrastructure. DarkSpam is in production.
+DarkChain and DarkARC are in active beta on production mail infrastructure.
 
 ## Author
 
