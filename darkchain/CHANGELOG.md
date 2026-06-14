@@ -1,5 +1,19 @@
 # Changelog darkchain suite
 
+## [0.3 - 13/06/2026]
+
+### Added
+
+- **Enforcement mode (verifier).** `#define ENFORCE 0|1` controls whether
+  the verifier rejects messages on DKIM2 failure. When `ENFORCE=1`:
+  `dkim2=fail` or `dkim2=permerror` → `550 5.7.1` (REJECT);
+  `dkim2=temperror` → `451 4.7.1` (TEMPFAIL). Default is 0 (log-only,
+  transitional mode). DKIM2-Authentication-Results and
+  X-DarkChain-Internal-Status are always injected before the
+  reject/tempfail decision, preserving observability.
+
+- **Version trace updated.** X-Signed header now reports `DarkChain 0.3`.
+
 ## [0.2 - 10/06/2026]
 
 ## [unreleased] — Security hardening pass
