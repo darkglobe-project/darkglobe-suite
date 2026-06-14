@@ -234,30 +234,24 @@ It does not implement `draft-ietf-dkim-dkim2-spec` directly. The deployment prof
 
 ## Operating Mode
 
-DarkChain currently operates in **transition mode** (log-only):
+DarkChain currently operates in **transition mode** (log-only) by default:
 
 - All verification results are logged via syslog and injected as
   `DKIM2-Authentication-Results` headers
-- No message is ever rejected — both milters always return `SMFIS_CONTINUE`
+- No message is rejected — both milters return `SMFIS_CONTINUE`
 - The `X-DarkChain-Internal-Status` header provides timing and diagnostics
   (removed before delivery by the signer)
 
-To switch to **enforcement mode**, three changes are required in the
-verifier (`DarkChain.c`), each marked with `[ENFORCEMENT]` in the code:
+To switch to **enforcement mode**, set `#define ENFORCE 1` in
+`DarkChain.c` and recompile. When enabled:
 
-1. `dc_eom()`: return `SMFIS_REJECT` on `dkim2=fail` or `dkim2=permerror`,
-   `SMFIS_TEMPFAIL` on `dkim2=temperror`. Per draft §3.5.1, the 5xx
-   rejection targets the connected peer — never the original sender —
-   preventing backscatter.
+- `dkim2=fail` or `dkim2=permerror` → `550 5.7.1` REJECT
+- `dkim2=temperror` → `451 4.7.1` TEMPFAIL
+- Per draft §3.5.1, the rejection targets the connected peer — never
+  the original sender — preventing backscatter
 
-2. `dc_header()`: the 128KB DKIM2 header cap currently sets `chain_broken`
-   and continues. In enforcement mode this returns `SMFIS_REJECT`
-   immediately.
-
-3. `dc_eoh()`: chain continuity errors (missing signature or mf at a
-   required hop) currently set `chain_broken`. In enforcement mode these
-   return `SMFIS_REJECT` to avoid processing the body of a message that
-   will be rejected.
+Authentication headers are always injected before the reject decision,
+preserving full observability in logs.
 
 The signer (`DarkChains.c`) always returns `SMFIS_CONTINUE` — it signs
 outbound mail but never rejects.
