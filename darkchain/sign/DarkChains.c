@@ -83,7 +83,6 @@ struct context
    int  header_capacity;
 
    /* Hop from verifier */
-   int  next_hop;               /* hops= from X-DarkChain-Internal-Status */
    char verifier_verdict[32];   /* pass/fail/none                         */
    int  found_prev_sigs;        /* count of DKIM2-Signature in reservoir  */
    int  max_prev_hop;           /* highest i= seen across ALL DKIM2 headers */
@@ -354,7 +353,6 @@ static sfsistat dcs_envfrom(SMFICTX *ctx, char **argv)
 
    ps->msg_count++;
    ps->header_cnt = 0;
-   ps->next_hop = 0;
    ps->verifier_verdict[0] = '\0';
    ps->found_prev_sigs = 0;
    ps->max_prev_hop = 0;
@@ -490,21 +488,8 @@ static sfsistat dcs_header(SMFICTX *ctx, char *headerf, char *headerv)
       trim(tmp);
       securecpy(ps->verifier_verdict, tmp, sizeof(ps->verifier_verdict));
 
-      const char *hp = dc_find_tag(headerv, "hops");
-      if (hp)
-      {
-         while (*hp == ' ' || *hp == '\t') hp++;
-         ps->next_hop = atoi(hp);
-         if (ps->next_hop < 1)
-         {
-            syslog(LOG_NOTICE, "DCS_HEADER: Invalid hops=%d in Internal-Status", ps->next_hop);
-            ps->next_hop = 0;
-         }
-         if (ps->next_hop > DC_MAX_HOPS) ps->next_hop = DC_MAX_HOPS;
-      }
-
-      syslog(LOG_INFO, "DCS_HEADER: Verifier status: verdict=%s, next_hop=%d",
-             ps->verifier_verdict, ps->next_hop);
+      syslog(LOG_INFO, "DCS_HEADER: Verifier status: verdict=%s",
+             ps->verifier_verdict);
       return SMFIS_CONTINUE;  /* Don't store this in reservoir */
    }
 
@@ -577,11 +562,12 @@ static sfsistat dcs_eoh(SMFICTX *ctx)
    struct context *ps = (struct context *)smfi_getpriv(ctx);
    if (!ps) return SMFIS_ACCEPT;
 
-   if (ps->next_hop > 1 && ps->max_prev_hop != ps->next_hop - 1)
+   if (ps->verifier_verdict[0] != '\0' && ps->found_prev_sigs > 0 &&
+       ps->max_prev_hop != ps->found_prev_sigs)
    {
       syslog(LOG_NOTICE,
-             "DCS_EOH: Hop mismatch: next_hop=%d but max_prev_hop=%d (sigs=%d)",
-             ps->next_hop, ps->max_prev_hop, ps->found_prev_sigs);
+             "DCS_EOH: Hop mismatch: max_prev_hop=%d but sigs=%d",
+             ps->max_prev_hop, ps->found_prev_sigs);
    }
 
    return SMFIS_CONTINUE;
@@ -674,10 +660,14 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    struct timespec ts_start, ts_end;
    clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
-   /* Outer gate */
-   if (ps->is_localhost == 0 && ps->max_prev_hop == 0)
+   /* Outer gate: skip if external, no previous DKIM2 chain,
+    * AND no verifier processing (verdict empty).
+    * If the verifier ran (verdict is set, even "none"), proceed.
+    */
+   if (ps->is_localhost == 0 && ps->max_prev_hop == 0 &&
+       ps->verifier_verdict[0] == '\0')
    {
-      syslog(LOG_DEBUG, "DCS_EOM: Not localhost, no prev DKIM2. Skip.");
+      syslog(LOG_DEBUG, "DCS_EOM: Not localhost, no prev DKIM2, no verifier. Skip.");
       return SMFIS_CONTINUE;
    }
 
@@ -685,15 +675,15 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    int generate_auth_result = 0;
    char auth_result_value[512] = "";
 
-   if (ps->next_hop > 0)
+   if (ps->verifier_verdict[0] != '\0' && ps->is_localhost == 0)
    {
-      /* Case A: verifier-processed */
-      N = ps->next_hop;
+      /* Case A: verifier-processed inbound/relay */
+      N = ps->found_prev_sigs + 1;
       generate_auth_result = 0;
-      syslog(LOG_INFO, "DCS_EOM: Case A — relayed, i=%d (verdict=%s)",
-             N, ps->verifier_verdict);
+      syslog(LOG_INFO, "DCS_EOM: Case A — i=%d (verdict=%s, sigs=%d)",
+             N, ps->verifier_verdict, ps->found_prev_sigs);
    }
-   else if (ps->next_hop == 0 && ps->is_localhost == 1 && ps->max_prev_hop > 0)
+   else if (ps->verifier_verdict[0] == '\0' && ps->is_localhost == 1 && ps->max_prev_hop > 0)
    {
       /* Case B: local mailing list signing after DKIM-Mod.
        * N = (highest DKIM2-Signature i=) + 1.  We derive this from
@@ -796,14 +786,24 @@ static sfsistat dcs_eom(SMFICTX *ctx)
       syslog(LOG_INFO, "DCS_EOM: Case C — local mail, i=1");
    }
 
-   /* Domain lookup from MAIL FROM */
+   /* Domain lookup: try sender domain first (outbound), then
+    * recipient domain (inbound from external), then default (relay).
+    */
    struct dc_domain_key *dk = lookup_domain_key(ps->envelope.mail_from);
+   if (!dk && ps->envelope.rcpt_count > 0)
+   {
+      /* Inbound: sender domain not in table — try recipient domain.
+       * MTA groups recipients by domain, so rcpt_to[0] is representative.
+       */
+      dk = lookup_domain_key(ps->envelope.rcpt_to[0]);
+      if (dk)
+         syslog(LOG_INFO, "DCS_EOM: Sender domain not in table, "
+                "signing with recipient domain d=%s", dk->domain);
+   }
    if (!dk)
    {
-      /* Relay fallback: if we're relaying (not locally originated),
-       * sign with the default domain key.
-       */
-      if (N > 1 && default_dk_loaded)
+      /* Last resort: neither sender nor recipient in table. */
+      if (default_dk_loaded)
       {
          dk = &default_dk;
          syslog(LOG_INFO, "DCS_EOM: Domain '%s' not in table, using default d=%s",
