@@ -70,6 +70,7 @@
 #define LOGLEVEL        LOG_ERR
 #define SYSLOG_FACILITY LOG_DAEMON
 #define DEBUG           0
+#define ENFORCE         0        /* 0=log only, 1=reject fail/permerror */
 
 /* Header hash exclusion config path */
 #define DC_HH_EXCLUDE_CONF  "/etc/DarkChain/hh_exclude.conf"
@@ -1930,6 +1931,30 @@ inject_result:
                cpu_buf, dns_buf, other_buf);
 
       smfi_addheader(ctx, "X-DarkChain-Internal-Status", h_val);
+   }
+
+   /* --- 9. ENFORCEMENT --- */
+   if (ENFORCE && ps->is_localhost == 0)
+   {
+      if (strcmp(dkim2_verdict, "fail") == 0 ||
+          strcmp(dkim2_verdict, "permerror") == 0)
+      {
+         syslog(LOG_NOTICE,
+                "DC_EOM: ENFORCE reject — dkim2=%s d=%s",
+                dkim2_verdict, signing_domain);
+         smfi_setreply(ctx, "550", "5.7.1",
+                       "DKIM2 verification failed");
+         return SMFIS_REJECT;
+      }
+      if (strcmp(dkim2_verdict, "temperror") == 0)
+      {
+         syslog(LOG_NOTICE,
+                "DC_EOM: ENFORCE tempfail — dkim2=%s",
+                dkim2_verdict);
+         smfi_setreply(ctx, "451", "4.7.1",
+                       "DKIM2 temporary verification error");
+         return SMFIS_TEMPFAIL;
+      }
    }
 
    return SMFIS_CONTINUE;
