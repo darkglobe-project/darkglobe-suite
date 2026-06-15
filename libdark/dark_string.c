@@ -14,6 +14,8 @@
 long securecpy(register char *pc_dst, register const char *pc_src, long l_sizeof)
 {
    register long i;
+   if (pc_dst == NULL || l_sizeof < 1) return (0);
+   if (pc_src == NULL) { pc_dst[0] = '\0'; return (0); }
    if (l_sizeof > 1)
    {
       pc_dst[0] = '\0';
@@ -31,9 +33,13 @@ long securecpy(register char *pc_dst, register const char *pc_src, long l_sizeof
 long securecat(register char *pc_dst, register const char *pc_src, long l_sizeof)
 {
    register long i, j;
+   if (pc_dst == NULL || l_sizeof < 1) return (0);
 
    for (j = 0; j < l_sizeof; j++)
       if (pc_dst[j] == 0) break;
+
+   /* NULL source: nothing to append, leave the existing string intact */
+   if (pc_src == NULL) return (j);
 
    if ((j + 1) == (l_sizeof))
       return (0);
