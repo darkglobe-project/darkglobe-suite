@@ -1,6 +1,6 @@
-# darkglobe-suite
+# darkglobe-suite - DKIM2 and ARC authentication milters
 
-A suite of milter components for email authentication and content filtering, deployable on any MTA supporting the milter protocol without core modifications.
+A suite of milter components for email authentication (DKIM2 and ARC), deployable on any MTA supporting the milter protocol without core modifications.
 
 ## Components
 
