@@ -6,7 +6,9 @@
 
 - **Improved the lookup logic** against the DKIM2 signed domains table, covering both inbound chains (under NOLOCALSIGN=0 conditions) and outbound traffic.
 
-- **Removed Dropped the implicit fallback/default case** that resolved to the host server's local domain name. Lookups are now strictly explicit.
+### Removed
+
+- **Dropped the implicit fallback/default case** that resolved to the host server's local domain name. Lookups are now strictly explicit.
 
 ## [0.3 - 13/06/2026]
 
