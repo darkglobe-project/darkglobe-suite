@@ -45,9 +45,11 @@
  * ================================================================ */
 
 #define OCONN           "unix:/var/spool/DarkChains/sock"
+/* --- DEFAULT DOMAIN (currently unused — reserved for future relay fallback) --- */
 #define DEFAULT_DOMAIN  "itb.it"          /* Fallback for relay signing   */
 #define DEFAULT_SELECT  "dkim2"           /* Fallback selector            */
 #define DEFAULT_KEYPATH "/etc/DarkChains/default.private"
+/* --- END DEFAULT DOMAIN --- */
 #define USER            "smmsp"
 #define LOGLEVEL        LOG_ERR
 #define SYSLOG_FACILITY LOG_DAEMON
@@ -121,8 +123,10 @@ struct dc_domain_key
 
 static struct dc_domain_key domain_table[DC_MAX_DOMAINS];
 static int domain_count = 0;
+/* --- DEFAULT DOMAIN (currently unused — reserved for future relay fallback) --- */
 static struct dc_domain_key default_dk;  /* Fallback for relay signing */
 static int default_dk_loaded = 0;
+/* --- END DEFAULT DOMAIN --- */
 
 
 /* ================================================================
@@ -802,19 +806,9 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    }
    if (!dk)
    {
-      /* Last resort: neither sender nor recipient in table. */
-      if (default_dk_loaded)
-      {
-         dk = &default_dk;
-         syslog(LOG_INFO, "DCS_EOM: Domain '%s' not in table, using default d=%s",
-                ps->envelope.mail_from, dk->domain);
-      }
-      else
-      {
-         syslog(LOG_NOTICE, "DCS_EOM: No key for domain of '%s'. Skip.",
-                ps->envelope.mail_from);
-         return SMFIS_CONTINUE;
-      }
+      syslog(LOG_NOTICE, "DCS_EOM: No key for '%s' (sender or recipient). Skip.",
+             ps->envelope.mail_from);
+      return SMFIS_CONTINUE;
    }
 
    /* ---- ENVELOPE REWRITING FOR RELAY ----
@@ -1311,7 +1305,7 @@ int main(int argc, char *argv[])
    }
    syslog(LOG_INFO, "DCS_MAIN: Loaded %d domain(s) from %s", n_domains, DC_DOMAINS_CONF);
 
-   /* Load default/fallback key for relay signing */
+   /* --- DEFAULT DOMAIN loading (currently unused — reserved for future relay fallback) --- */
    default_dk.pkey = load_private_key(DEFAULT_KEYPATH);
    if (default_dk.pkey)
    {
@@ -1327,6 +1321,7 @@ int main(int argc, char *argv[])
       syslog(LOG_NOTICE, "DCS_MAIN: No default relay key at %s — relay signing disabled",
              DEFAULT_KEYPATH);
    }
+   /* --- END DEFAULT DOMAIN loading --- */
 
    /* Load header hash exclusion patterns */
    load_hh_excludes(DC_HH_EXCLUDE_CONF);
