@@ -20,7 +20,7 @@ This is not an official DKIM2 implementation, but a practical, running implement
 
 ```bash
 # Build
-cd darkchain/verify && make && cd ../sign && make
+cd dkim2-darkchain/verify && make && cd ../sign && make
 
 # Socket directories
 mkdir -p /var/spool/DarkChain /var/spool/DarkChains
@@ -79,7 +79,7 @@ DKIM2-core does not require trust in intermediaries. The chain self-validates: e
 ```
 darkglobe-suite/
 ├── libdark/          - shared crypto, canonicalization, utilities (MIT)
-└── darkchain/
+└── dkim2-darkchain/
     ├── dc_shared.*   - shared DKIM2-core logic
     ├── verify/
     │   └── DarkChain.c    - inbound verifier milter
@@ -106,8 +106,8 @@ DarkChain and DarkChains are milter processes. They require no MTA core modifica
 ### Build
 
 ```bash
-cd darkchain/verify && make
-cd darkchain/sign && make
+cd dkim2-darkchain/verify && make
+cd dkim2-darkchain/sign && make
 ```
 
 Both binaries link against libmilter and libdark. See `libdark/` for build instructions.
@@ -131,6 +131,7 @@ Signing milters follow content filtering, so they see the final form of the mess
 8. **DKIM2-core signing (DarkChains)**
 
 DarkChain runs on inbound only. DarkChains runs on outbound only. Both can be declared in the same MTA configuration - the milter protocol and MTA routing logic handle the separation.
+
 ## Configuration
 
 ### Verifier (DarkChain)
@@ -153,8 +154,8 @@ applied regardless of this file.
 X-
 Message-Instance
 ```
-If the file is absent, only the built-in exclusions apply.
 
+If the file is absent, only the built-in exclusions apply.
 
 ### Signer (DarkChains)
 
@@ -166,8 +167,11 @@ chown smmsp:smmsp /var/spool/DarkChains
 
 **`/etc/DarkChains/domains.conf`** (required) — domain-to-key mapping,
 one line per domain. Format: `domain  selector  /path/to/private.key`
+
+```
 itb.it          dkim2  /etc/DarkChains/itb.it.private
 pacedisarmo.org dkim2  /etc/DarkChains/pacedisarmo.org.private
+```
 
 The signer looks up the MAIL FROM domain in this table. If no match is
 found (including up to two subdomain levels), the message is not signed.
@@ -178,14 +182,9 @@ privilege drop).
 behavior as the verifier's file. Both milters should use the same
 exclusion list to ensure `hh=` values match.
 
-### Sendmail integration
-
-Add to `sendmail.mc`, DarkChain **before** DarkChains in the milter chain:
-
-
 ### Sendmail configuration
 
-Add the following to your `sendmail.mc`, adjusting macro definitions as needed for your environment:
+Add to `sendmail.mc`, DarkChain **before** DarkChains in the milter chain. Adjust macro definitions as needed for your environment:
 
 ```m4
 define(`confMILTER_MACROS_CONNECT',
@@ -235,7 +234,9 @@ chown smmsp:smmsp /var/spool/DarkChain /var/spool/DarkChains
 ```
 
 ## Running scripts
+
 ### Signer
+
 ```bash
 PIDFILE="/var/run/darkchains.pid"
 pgrep -x DarkChains >/dev/null && { echo "DarkChains already running"; exit 1; }
@@ -245,6 +246,7 @@ pgrep -x DarkChains > "$PIDFILE"
 ```
 
 ### Verifier
+
 ```bash
 PIDFILE="/var/run/darkchain.pid"
 pgrep -x DarkChain >/dev/null && { echo "DarkChain already running"; exit 1; }
@@ -252,7 +254,6 @@ su -c "/usr/local/sbin/DarkChain &" -s /bin/sh - smmsp
 sleep 1
 pgrep -x DarkChain > "$PIDFILE"
 ```
-
 
 ### Key generation
 
@@ -264,11 +265,13 @@ openssl rsa -in /etc/DarkChains/itb.it.private -pubout -outform DER | openssl ba
 
 Publish the base64 public key as a DNS TXT record:
 
+```
 dkim2._domainkey.itb.it  IN TXT "v=DKIM1; k=rsa; p=<base64 public key>"
+```
 
 ### DNS
 
-DarkChains requires a DKIM2 signing key published in DNS. Key format and selector configuration follow the conventions of the DKIM2 base specification. See `darkchain/sign/README.md` for key generation and DNS record format.
+DarkChains requires a DKIM2 signing key published in DNS. Key format and selector configuration follow the conventions of the DKIM2 base specification. See `dkim2-darkchain/sign/README.md` for key generation and DNS record format.
 
 ## Specification
 
