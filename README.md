@@ -8,7 +8,7 @@ A suite of milter components for email authentication (DKIM2 and ARC), deployabl
 
 | Component | Function | License |
 |-----------|----------|---------|
-| [DarkChain](darkchain/) | DKIM2-core verifier and signer | Apache 2.0 |
+| [DarkChain](dkim2-darkchain/) | DKIM2-core verifier and signer | Apache 2.0 |
 | [DarkARC](darkarc/) | ARC verifier and signer (RFC 8617) | PolyForm Noncommercial 1.0.0 |
 
 ## Shared library
