@@ -1,4 +1,4 @@
-# DarkChain / DarkChains
+# DarkChain / DarkChains (DKIM2)
 
 **Quick take:** a DKIM2 core verifier (DarkChain) and signer (DarkChains) milter pair, in C. Drop-in for Sendmail or Postfix via standard milter sockets - no MTA changes, no JSON, no persistent state. Running in production today, log-only by default, enforcement mode behind a single compile flag.
 
@@ -14,7 +14,7 @@
 - ✅ Tested with Sendmail
 - ⚠️ Looking for Postfix testing / feedback
 
-This is not an official DKIM2 implementation, but a practical, running implementation of a deployable core profile - verified against live traffic from Microsoft Exchange Online and Google's MTA infrastructure.
+This is not an official DKIM2 implementation, but a practical, running implementation of a deployable core profile.
 
 ## Quick start
 
