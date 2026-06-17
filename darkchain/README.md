@@ -1,6 +1,50 @@
 # DarkChain / DarkChains
 
-DKIM2-core verifier and signer milters for production mail infrastructure.
+**Quick take:** a DKIM2 core verifier (DarkChain) and signer (DarkChains) milter pair, in C. Drop-in for Sendmail or Postfix via standard milter sockets - no MTA changes, no JSON, no persistent state. Running in production today, log-only by default, enforcement mode behind a single compile flag.
+
+- 5-minute setup: build, point the MTA at the socket, done
+- Tested live with Microsoft Exchange Online and Google MTA traffic
+- Not a full DKIM2 implementation - see [Specification](#specification) for what this profile covers
+
+---
+
+- ✅ Stateless milter
+- ✅ Streaming (no body buffering)
+- ✅ No MTA core changes required
+- ✅ Tested with Sendmail
+- ⚠️ Looking for Postfix testing / feedback
+
+This is not an official DKIM2 implementation, but a practical, running implementation of a deployable core profile - verified against live traffic from Microsoft Exchange Online and Google's MTA infrastructure.
+
+## Quick start
+
+```bash
+# Build
+cd darkchain/verify && make && cd ../sign && make
+
+# Socket directories
+mkdir -p /var/spool/DarkChain /var/spool/DarkChains
+chown smmsp:smmsp /var/spool/DarkChain /var/spool/DarkChains
+
+# Signer config (required): domain, selector, private key path
+mkdir -p /etc/DarkChains
+echo "yourdomain.tld  dkim2  /etc/DarkChains/yourdomain.tld.private" > /etc/DarkChains/domains.conf
+openssl genrsa -out /etc/DarkChains/yourdomain.tld.private 2048
+
+# Publish the public key in DNS (copy the output into a TXT record)
+echo -n 'v=DKIM1; k=rsa; p=' && openssl rsa -in /etc/DarkChains/yourdomain.tld.private -pubout -outform DER | openssl base64 -A
+# dkim2._domainkey.yourdomain.tld  IN TXT  "v=DKIM1; k=rsa; p=<paste above>"
+
+# Run
+su -c "/usr/local/sbin/DarkChain &" -s /bin/sh - smmsp
+su -c "/usr/local/sbin/DarkChains &" -s /bin/sh - smmsp
+```
+
+Add the milter sockets to `sendmail.mc` (see [Sendmail configuration](#sendmail-configuration) below), reload, and you are running. The verifier is log-only by default - no message is ever rejected until enforcement mode is explicitly enabled (see [Operating Mode](#operating-mode)).
+
+Full configuration, pipeline ordering, key rotation, and enforcement details are in the sections below.
+
+---
 
 ## What this is
 
