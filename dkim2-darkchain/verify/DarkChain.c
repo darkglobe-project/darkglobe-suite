@@ -1828,6 +1828,15 @@ static sfsistat dc_eom(SMFICTX *ctx)
             syslog(LOG_INFO, "DC_EOM: Envelope mf= MATCH (exact + domain)");
          }
       }
+      else
+      {
+         /* Null sender (DSN bounce) or empty mf=: skip alignment,
+          * set envelope_vfy so rt= check can proceed.
+          * RFC 5321 requires <> for bounces — no domain to align.
+          */
+         ps->envelope_vfy = 1;
+         syslog(LOG_INFO, "DC_EOM: Envelope mf= empty (DSN/null sender), alignment skipped");
+      }
 
       int rt_match_count = 0;
 
