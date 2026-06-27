@@ -86,6 +86,7 @@ struct context
 
    /* Hop from verifier */
    char verifier_verdict[32];   /* pass/fail/none                         */
+   int  internal_status_count;  /* count of Internal-Status headers seen   */
    int  found_prev_sigs;        /* count of DKIM2-Signature in reservoir  */
    int  max_prev_hop;           /* highest i= seen across ALL DKIM2 headers */
 
@@ -102,6 +103,7 @@ struct context
 
    int  is_localhost;
    int  is_local_delivery;       /* 1 if all RCPT TO are local (no smtp/esmtp) */
+   char rcpt_to_orig[DC_MAX_ADDR]; /* RCPT TO pre-virtusertable (argv[0])    */
    char helo[MAXHOST];
 
    struct timespec start_time;
@@ -358,9 +360,11 @@ static sfsistat dcs_envfrom(SMFICTX *ctx, char **argv)
    ps->msg_count++;
    ps->header_cnt = 0;
    ps->verifier_verdict[0] = '\0';
+   ps->internal_status_count = 0;
    ps->found_prev_sigs = 0;
    ps->max_prev_hop = 0;
    ps->is_local_delivery = 1;   /* assume local until smtp/esmtp rcpt seen */
+   ps->rcpt_to_orig[0] = '\0';
    ps->envelope.rcpt_count = 0;
    ps->body_size = 0;
    ps->pending_newlines = 0;
@@ -409,7 +413,14 @@ static sfsistat dcs_envrcpt(SMFICTX *ctx, char **argv)
     * (post-alias, post-virtusertable). argv[0] is the original
     * RCPT TO from the SMTP wire.  For forwarding, we need the
     * resolved address so that rt= matches the next hop's RCPT TO.
+    *
+    * Save argv[0] (pre-virtusertable) for domain key lookup —
+    * in forwarding, the original RCPT TO domain may be in our table
+    * while the resolved domain is not.
     */
+   if (ps->rcpt_to_orig[0] == '\0' && argv[0])
+      dc_strip_angle_brackets(argv[0], ps->rcpt_to_orig, sizeof(ps->rcpt_to_orig));
+
    const char *rcpt_addr = smfi_getsymval(ctx, "{rcpt_addr}");
    const char *rcpt_host = smfi_getsymval(ctx, "{rcpt_host}");
    const char *effective_rcpt = argv[0];  /* fallback */
@@ -482,9 +493,22 @@ static sfsistat dcs_header(SMFICTX *ctx, char *headerf, char *headerv)
    struct context *ps = (struct context *)smfi_getpriv(ctx);
    if (!ps) return SMFIS_CONTINUE;
 
-   /* Detect X-DarkChain-Internal-Status from the verifier */
+   /* Detect X-DarkChain-Internal-Status from the verifier.
+    * Multiple instances = possible injection attack → permerror.
+    */
    if (strcasecmp(headerf, "X-DarkChain-Internal-Status") == 0)
    {
+      ps->internal_status_count++;
+      if (ps->internal_status_count > 1)
+      {
+         securecpy(ps->verifier_verdict, "permerror", sizeof(ps->verifier_verdict));
+         syslog(LOG_WARNING,
+                "DCS_HEADER: Multiple X-DarkChain-Internal-Status detected "
+                "(%d) — possible injection, forcing permerror",
+                ps->internal_status_count);
+         return SMFIS_CONTINUE;
+      }
+
       char tmp[256];
       securecpy(tmp, headerv, sizeof(tmp));
       char *semi = strchr(tmp, ';');
@@ -791,14 +815,23 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    }
 
    /* Domain lookup: try sender domain first (outbound), then
-    * recipient domain (inbound from external), then default (relay).
+    * original RCPT TO pre-virtusertable (forwarding), then
+    * resolved RCPT TO (inbound from external).
     */
    struct dc_domain_key *dk = lookup_domain_key(ps->envelope.mail_from);
+   if (!dk && ps->rcpt_to_orig[0] != '\0')
+   {
+      /* Forwarding: original RCPT TO domain may be ours even though
+       * the resolved address points elsewhere.
+       */
+      dk = lookup_domain_key(ps->rcpt_to_orig);
+      if (dk)
+         syslog(LOG_INFO, "DCS_EOM: Using original RCPT TO domain d=%s",
+                dk->domain);
+   }
    if (!dk && ps->envelope.rcpt_count > 0)
    {
-      /* Inbound: sender domain not in table — try recipient domain.
-       * MTA groups recipients by domain, so rcpt_to[0] is representative.
-       */
+      /* Inbound: try resolved recipient domain. */
       dk = lookup_domain_key(ps->envelope.rcpt_to[0]);
       if (dk)
          syslog(LOG_INFO, "DCS_EOM: Sender domain not in table, "
