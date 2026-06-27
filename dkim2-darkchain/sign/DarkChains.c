@@ -409,6 +409,24 @@ static sfsistat dcs_envrcpt(SMFICTX *ctx, char **argv)
    struct context *ps = (struct context *)smfi_getpriv(ctx);
    if (!ps) return SMFIS_CONTINUE;
 
+   if (DEBUG)
+   {
+      static const char *dbg_macros[] = 
+      {
+         "{rcpt_addr}", "{rcpt_host}", "{rcpt_mailer}",
+         "{mail_addr}", "{mail_host}", "{mail_mailer}",
+         "i", "j", "{client_addr}", "{daemon_name}", NULL
+      };
+      for (int dbg_i = 0; dbg_macros[dbg_i]; dbg_i++) 
+      {
+         const char *dbg_v = smfi_getsymval(ctx, (char *)dbg_macros[dbg_i]);
+         syslog(LOG_INFO, "DCS_MACRO[ENVRCPT] argv0='%s' %s = %s",
+              (argv && argv[0]) ? argv[0] : "NULL",
+              dbg_macros[dbg_i], dbg_v ? dbg_v : "(NULL)");
+      }
+   }
+   /* ---- END DEBUG ---- */
+
    /* Sendmail macros: {rcpt_addr} contains the resolved address
     * (post-alias, post-virtusertable). argv[0] is the original
     * RCPT TO from the SMTP wire.  For forwarding, we need the
