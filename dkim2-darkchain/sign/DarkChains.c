@@ -409,24 +409,6 @@ static sfsistat dcs_envrcpt(SMFICTX *ctx, char **argv)
    struct context *ps = (struct context *)smfi_getpriv(ctx);
    if (!ps) return SMFIS_CONTINUE;
 
-   if (DEBUG)
-   {
-      static const char *dbg_macros[] = 
-      {
-         "{rcpt_addr}", "{rcpt_host}", "{rcpt_mailer}",
-         "{mail_addr}", "{mail_host}", "{mail_mailer}",
-         "i", "j", "{client_addr}", "{daemon_name}", NULL
-      };
-      for (int dbg_i = 0; dbg_macros[dbg_i]; dbg_i++) 
-      {
-         const char *dbg_v = smfi_getsymval(ctx, (char *)dbg_macros[dbg_i]);
-         syslog(LOG_INFO, "DCS_MACRO[ENVRCPT] argv0='%s' %s = %s",
-              (argv && argv[0]) ? argv[0] : "NULL",
-              dbg_macros[dbg_i], dbg_v ? dbg_v : "(NULL)");
-      }
-   }
-   /* ---- END DEBUG ---- */
-
    /* Sendmail macros: {rcpt_addr} contains the resolved address
     * (post-alias, post-virtusertable). argv[0] is the original
     * RCPT TO from the SMTP wire.  For forwarding, we need the
@@ -721,7 +703,9 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    int generate_auth_result = 0;
    char auth_result_value[512] = "";
 
-   if (ps->verifier_verdict[0] != '\0' && ps->is_localhost == 0)
+   if (ps->verifier_verdict[0] != '\0')
+   /* Postfix patch */
+   // && ps->is_localhost == 0) 
    {
       /* Case A: verifier-processed inbound/relay */
       N = ps->found_prev_sigs + 1;
@@ -830,6 +814,18 @@ static sfsistat dcs_eom(SMFICTX *ctx)
       snprintf(auth_result_value, sizeof(auth_result_value),
                "i=1; %s; dkim2=none", my_hostname);
       syslog(LOG_INFO, "DCS_EOM: Case C — local mail, i=1");
+   }
+
+   /* Broken chain: if the verifier reported fail or permerror,
+    * the chain is compromised — don't extend it with a new signature.
+    * Internal-Status was already stripped above.
+    */
+   if (strcmp(ps->verifier_verdict, "fail") == 0 ||
+       strcmp(ps->verifier_verdict, "permerror") == 0)
+   {
+      syslog(LOG_NOTICE, "DCS_EOM: Verifier verdict=%s — chain broken, skip signing",
+             ps->verifier_verdict);
+      return SMFIS_CONTINUE;
    }
 
    /* Domain lookup: try sender domain first (outbound), then
