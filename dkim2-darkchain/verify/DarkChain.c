@@ -688,6 +688,15 @@ static sfsistat dc_connect(SMFICTX *ctx, char *hostname, _SOCK_ADDR *hostaddr)
    ps->mdctx_header = EVP_MD_CTX_new();
    ps->mdctx_body   = EVP_MD_CTX_new();
 
+   if (ps->mdctx_header == NULL || ps->mdctx_body == NULL)
+   {
+      EVP_MD_CTX_free(ps->mdctx_header);
+      EVP_MD_CTX_free(ps->mdctx_body);
+      free(ps);
+      smfi_setpriv(ctx, NULL);
+      return SMFIS_TEMPFAIL;
+   }
+
    EVP_DigestInit_ex(ps->mdctx_header, EVP_sha256(), NULL);
    EVP_DigestInit_ex(ps->mdctx_body,   EVP_sha256(), NULL);
 
@@ -698,6 +707,18 @@ static sfsistat dc_connect(SMFICTX *ctx, char *hostname, _SOCK_ADDR *hostaddr)
    ps->envelope.rcpt_capacity = DC_RCPT_INITIAL;
    ps->envelope.rcpt_count = 0;
    ps->envelope.rcpt_to = calloc(DC_RCPT_INITIAL, DC_MAX_ADDR);
+
+   if (ps->headers == NULL || ps->envelope.rcpt_to == NULL)
+   {
+      syslog(LOG_ERR, "DC_CONNECT: allocation failed");
+      free(ps->headers);
+      free(ps->envelope.rcpt_to);
+      EVP_MD_CTX_free(ps->mdctx_header);
+      EVP_MD_CTX_free(ps->mdctx_body);
+      free(ps);
+      smfi_setpriv(ctx, NULL);
+      return SMFIS_TEMPFAIL;
+   }
 
    /* Rollback scratch — allocated once for the connection, reused per
     * message, freed in dc_close().  Keeps a ~128KB buffer off the stack. */
