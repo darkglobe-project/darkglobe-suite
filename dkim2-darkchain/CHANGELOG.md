@@ -28,6 +28,14 @@ empty (`<>`), as mandated by RFC 5321 to prevent bounce loops. The verifier
 treats an empty `mf=` as legitimate: envelope-sender alignment is skipped rather
 than failed, so a null-sender DSN is not rejected on alignment grounds.
 
+### Memory safety hardening
+
+Audited and hardened allocation handling in both milters: missing NULL checks
+on per-connection buffers and OpenSSL contexts now fail cleanly with
+SMFIS_TEMPFAIL instead of risking a crash under memory pressure. The signing
+path also validates the return value of every OpenSSL signing call, so a failed
+signature produces a clean error rather than a malformed DKIM2-Signature.
+
 
 ## [0.4 - 16/06/2026]
 
