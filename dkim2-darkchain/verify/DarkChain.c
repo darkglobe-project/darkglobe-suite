@@ -75,6 +75,16 @@
 /* Header hash exclusion config path */
 #define DC_HH_EXCLUDE_CONF  "/etc/DarkChain/hh_exclude.conf"
 
+/* Domain table: the verifier only needs to know which domains are
+ * DKIM2-enabled on this host, so it can decide whether to inject a
+ * DKIM2-Authentication-Results record. It does NOT need the private keys
+ * (it never signs), so it loads only the domain names. The conf file is
+ * shared with the signer; a symlink
+ *   /etc/DarkChain/domains.conf -> /etc/DarkChains/domains.conf
+ * keeps a single source of truth. */
+#define DC_DOMAINS_CONF     "/etc/DarkChain/domains.conf"
+#define DC_MAX_DOMAINS      64
+
 /* Envelope storage */
 #define DC_MAX_RCPT         500     /* Max RCPT TO — aligned with DC_MAX_RT  */
 
@@ -165,6 +175,75 @@ struct dc_hop_index
 const char *pc_oconn = OCONN;
 const char *pc_user  = USER;
 char  my_hostname[256] = "";
+
+/* ================================================================
+ * DOMAIN TABLE (verifier: names only, no keys)
+ * ================================================================ */
+
+static char dc_domains[DC_MAX_DOMAINS][256];
+static int  dc_domain_count = 0;
+
+/* Load DKIM2-enabled domain names from the shared domains.conf.
+ * Line format matches the signer: "domain selector keypath"; we keep
+ * only the first field. Missing file is not fatal: a host with no
+ * DKIM2 domains (e.g. a list-only domain) simply has an empty table,
+ * and the verifier will then inject no DKIM2-AR. */
+static int dc_load_domains(const char *conf_path)
+{
+   FILE *fp = fopen(conf_path, "r");
+   if (!fp)
+   {
+      syslog(LOG_INFO, "DC_MAIN: no domain table at %s (%s) — "
+             "DKIM2-AR injection disabled", conf_path, strerror(errno));
+      dc_domain_count = 0;
+      return 0;
+   }
+
+   char line[1024];
+   dc_domain_count = 0;
+
+   while (fgets(line, sizeof(line), fp) && dc_domain_count < DC_MAX_DOMAINS)
+   {
+      char *p = line;
+      while (*p == ' ' || *p == '\t') p++;
+      if (*p == '#' || *p == '\n' || *p == '\0') continue;
+
+      char dom[256];
+      if (sscanf(p, "%255s", dom) != 1) continue;
+
+      securecpy(dc_domains[dc_domain_count], dom, 256);
+      syslog(LOG_INFO, "DC_MAIN: DKIM2-enabled domain: %s", dom);
+      dc_domain_count++;
+   }
+   fclose(fp);
+   return dc_domain_count;
+}
+
+/* Return 1 if the domain of addr is DKIM2-enabled on this host, else 0.
+ * Match is exact first, then relaxed (up to 2 leading labels removed),
+ * mirroring the signer's lookup_domain_key. */
+static int dc_domain_enabled(const char *addr)
+{
+   if (!addr || !*addr || dc_domain_count == 0) return 0;
+   const char *at = strchr(addr, '@');
+   const char *domain = at ? at + 1 : addr;
+
+   for (int i = 0; i < dc_domain_count; i++)
+      if (strcasecmp(domain, dc_domains[i]) == 0)
+         return 1;
+
+   const char *p = domain;
+   for (int removed = 0; removed < 2; removed++)
+   {
+      p = strchr(p, '.');
+      if (!p) break;
+      p++;
+      for (int i = 0; i < dc_domain_count; i++)
+         if (strcasecmp(p, dc_domains[i]) == 0)
+            return 1;
+   }
+   return 0;
+}
 
 
 /* ================================================================
@@ -1899,7 +1978,14 @@ cleanup_key:
 inject_result:
 
    /* --- 8. INJECT DKIM2-AUTHENTICATION-RESULTS --- */
-   if (ps->is_localhost == 0)
+   /* Only inject if this host is DKIM2-enabled for the recipient domain.
+    * Inbound MTA sessions are per recipient domain, so rcpt_to[0] is
+    * representative. A domain that is not in the table (e.g. a list-only
+    * domain like pacedisarmo.org co-hosted with a DKIM2 domain) must NOT
+    * inject a DKIM2-AR: the chain begins at the first DKIM2-enabled hop. */
+   if (ps->is_localhost == 0 &&
+       ps->envelope.rcpt_count > 0 &&
+       dc_domain_enabled(ps->envelope.rcpt_to[0]))
    {
       int next_hop = (ps->max_hop > 0) ? ps->max_hop + 1 : 1;
 
@@ -2098,6 +2184,9 @@ int main(int argc, char *argv[])
       else
          securecpy(my_hostname, "localhost", sizeof(my_hostname));
    }
+
+   /* Load DKIM2-enabled domains: gate DKIM2-AR injection on membership. */
+   dc_load_domains(DC_DOMAINS_CONF);
 
    int i_get = 0, i_ret = 0;
    const char *pc_ofile = NULL;
