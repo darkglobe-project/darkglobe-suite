@@ -1,4 +1,33 @@
-# Changelog darkchain suite
+# Changelog DarkChain / DarkChains (DKIM2)
+
+
+## [0.5 - 30/06/2026]
+
+## [Unreleased]
+
+### Postfix compatibility (Case A)
+The signer's hop-classification no longer keys Case A (inbound/relay) on the
+connection origin (`is_localhost`). When a message is re-injected through a
+loopback cascade â€” as required on Postfix to apply SRS before signing â€” the
+client address is always `127.0.0.1`, which previously misclassified relayed
+mail as locally originated. Case A is now driven by the presence of a verifier
+verdict, so a message that carries one is treated as relay regardless of the
+connecting IP. This makes the two-stage Postfix cascade behave like the
+single-pass Sendmail path.
+
+### DKIM2-Authentication-Results: gate on domain table
+The verifier no longer injects a `DKIM2-Authentication-Results` header for
+domains that are not DKIM2-enabled on this host. The verifier now loads the
+shared domain table (`/etc/DarkChain/domains.conf`, typically a symlink to the
+signer's `/etc/DarkChains/domains.conf`) and injects the AR record only when the
+recipient domain is present in it.
+
+### DSN / null sender (mf=)
+When a message is a DSN (Delivery Status Notification) the envelope sender is
+empty (`<>`), as mandated by RFC 5321 to prevent bounce loops. The verifier
+treats an empty `mf=` as legitimate: envelope-sender alignment is skipped rather
+than failed, so a null-sender DSN is not rejected on alignment grounds.
+
 
 ## [0.4 - 16/06/2026]
 
