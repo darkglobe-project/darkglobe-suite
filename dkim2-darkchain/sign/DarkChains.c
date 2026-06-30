@@ -1209,7 +1209,7 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    }
 
    char xsigned[100] = "";
-   snprintf (xsigned, sizeof(xsigned), "DarkChain 0.4 i=%d", N);
+   snprintf (xsigned, sizeof(xsigned), "DarkChain 0.5 i=%d", N);
    smfi_addheader(ctx, "X-Signed", xsigned);
 
    /* Timing */
