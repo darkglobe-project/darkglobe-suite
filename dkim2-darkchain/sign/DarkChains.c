@@ -292,6 +292,12 @@ static sfsistat dcs_connect(SMFICTX *ctx, char *hostname, _SOCK_ADDR *hostaddr)
    smfi_setpriv(ctx, ps);
 
    ps->mdctx_body = EVP_MD_CTX_new();
+   if (!ps->mdctx_body)
+   {
+      free(ps);
+      smfi_setpriv(ctx, NULL);
+      return SMFIS_TEMPFAIL;
+   }
    EVP_DigestInit_ex(ps->mdctx_body, EVP_sha256(), NULL);
 
    ps->header_capacity = INITIAL_CAPACITY;
@@ -299,6 +305,17 @@ static sfsistat dcs_connect(SMFICTX *ctx, char *hostname, _SOCK_ADDR *hostaddr)
 
    ps->envelope.rcpt_capacity = DC_RCPT_INITIAL;
    ps->envelope.rcpt_to = calloc(DC_RCPT_INITIAL, DC_MAX_ADDR);
+
+   if (!ps->headers || !ps->envelope.rcpt_to)
+   {
+      syslog(LOG_ERR, "DCS_CONNECT: allocation failed");
+      EVP_MD_CTX_free(ps->mdctx_body);
+      free(ps->headers);
+      free(ps->envelope.rcpt_to);
+      free(ps);
+      smfi_setpriv(ctx, NULL);
+      return SMFIS_TEMPFAIL;
+   }
 
    ps->is_localhost = 0;
 
@@ -1155,9 +1172,29 @@ static sfsistat dcs_eom(SMFICTX *ctx)
          return SMFIS_TEMPFAIL;
       }
       size_t sig_len = 0;
-      EVP_DigestSign(sctx, NULL, &sig_len, (unsigned char *)sign_buf, sign_len);
+      if (EVP_DigestSign(sctx, NULL, &sig_len, (unsigned char *)sign_buf, sign_len) != 1
+          || sig_len == 0)
+      {
+         syslog(LOG_ERR, "DCS_EOM: DigestSign Ed25519 sizing failed");
+         EVP_MD_CTX_free(sctx);
+         free(sign_buf); free(bh_b64); free(hh_b64); if (rt_values) free(rt_values);
+         return SMFIS_TEMPFAIL;
+      }
       unsigned char *sig_raw = malloc(sig_len);
-      EVP_DigestSign(sctx, sig_raw, &sig_len, (unsigned char *)sign_buf, sign_len);
+      if (!sig_raw)
+      {
+         syslog(LOG_ERR, "DCS_EOM: malloc(sig_len) failed (Ed25519)");
+         EVP_MD_CTX_free(sctx);
+         free(sign_buf); free(bh_b64); free(hh_b64); if (rt_values) free(rt_values);
+         return SMFIS_TEMPFAIL;
+      }
+      if (EVP_DigestSign(sctx, sig_raw, &sig_len, (unsigned char *)sign_buf, sign_len) != 1)
+      {
+         syslog(LOG_ERR, "DCS_EOM: DigestSign Ed25519 failed");
+         EVP_MD_CTX_free(sctx); free(sig_raw);
+         free(sign_buf); free(bh_b64); free(hh_b64); if (rt_values) free(rt_values);
+         return SMFIS_TEMPFAIL;
+      }
       EVP_MD_CTX_free(sctx);
       b64_signature = encode_base64_hash(sig_raw, sig_len);
       free(sig_raw);
@@ -1177,9 +1214,28 @@ static sfsistat dcs_eom(SMFICTX *ctx)
       }
       EVP_DigestSignUpdate(sctx, sign_buf, sign_len);
       size_t sig_len = 0;
-      EVP_DigestSignFinal(sctx, NULL, &sig_len);
+      if (EVP_DigestSignFinal(sctx, NULL, &sig_len) != 1 || sig_len == 0)
+      {
+         syslog(LOG_ERR, "DCS_EOM: DigestSignFinal RSA sizing failed");
+         EVP_MD_CTX_free(sctx);
+         free(sign_buf); free(bh_b64); free(hh_b64); if (rt_values) free(rt_values);
+         return SMFIS_TEMPFAIL;
+      }
       unsigned char *sig_raw = malloc(sig_len);
-      EVP_DigestSignFinal(sctx, sig_raw, &sig_len);
+      if (!sig_raw)
+      {
+         syslog(LOG_ERR, "DCS_EOM: malloc(sig_len) failed (RSA)");
+         EVP_MD_CTX_free(sctx);
+         free(sign_buf); free(bh_b64); free(hh_b64); if (rt_values) free(rt_values);
+         return SMFIS_TEMPFAIL;
+      }
+      if (EVP_DigestSignFinal(sctx, sig_raw, &sig_len) != 1)
+      {
+         syslog(LOG_ERR, "DCS_EOM: DigestSignFinal RSA failed");
+         EVP_MD_CTX_free(sctx); free(sig_raw);
+         free(sign_buf); free(bh_b64); free(hh_b64); if (rt_values) free(rt_values);
+         return SMFIS_TEMPFAIL;
+      }
       EVP_MD_CTX_free(sctx);
       b64_signature = encode_base64_hash(sig_raw, sig_len);
       free(sig_raw);
