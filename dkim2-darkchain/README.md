@@ -157,6 +157,24 @@ Message-Instance
 
 If the file is absent, only the built-in exclusions apply.
 
+**`/etc/DarkChain/domains.conf`** (recommended) — the list of DKIM2-enabled
+domains served by this host. The verifier injects a
+`DKIM2-Authentication-Results` header **only** when the recipient domain is
+present in this table. This prevents a non-DKIM2 domain that is co-hosted with
+a DKIM2 domain (for example a mailing-list domain) from emitting a spurious
+`dkim2=none` record: the DKIM2 chain correctly begins at the first
+DKIM2-enabled hop.
+
+The verifier reads the same table as the signer and uses only the domain name
+field (it never needs the keys). Keep a single source of truth with a symlink:
+
+```bash
+ln -s /etc/DarkChains/domains.conf /etc/DarkChain/domains.conf
+```
+
+If the file is absent, the table is empty and the verifier injects no
+`DKIM2-Authentication-Results` records.
+
 ### Signer (DarkChains)
 
 ```bash
