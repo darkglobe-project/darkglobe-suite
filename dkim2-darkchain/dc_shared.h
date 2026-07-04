@@ -119,6 +119,7 @@ char *dc_compute_hh(struct header_slot *headers, int header_cnt);
 int   dc_extract_addresses(const char *hdr, char addrs[][DC_MAX_ADDR], int max_addrs);
 int  dc_is_single_field(const char *name);
 int  cmp_canon_value(struct header_slot *a, struct header_slot *b);
+int  cmp_canon_value_q(const void *a, const void *b);
 int  cmp_header_hh(const void *a, const void *b);
 int  cmp_mod_canonical(const void *a, const void *b);
 int  cmp_rt_by_v(const void *a, const void *b);
