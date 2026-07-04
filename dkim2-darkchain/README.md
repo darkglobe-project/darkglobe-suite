@@ -200,6 +200,10 @@ privilege drop).
 behavior as the verifier's file. Both milters should use the same
 exclusion list to ensure `hh=` values match.
 
+**`/etc/DarkChains/srs.key`** (optional) - SRS key generation
+openssl rand -base64 32 > /etc/DarkChains/srs.key
+chmod 600 /etc/DarkChains/srs.key
+
 ### Sendmail configuration
 
 Add to `sendmail.mc`, DarkChain **before** DarkChains in the milter chain. Adjust macro definitions as needed for your environment:
