@@ -1,6 +1,6 @@
 # Postfix Configuration: SRS Routing + Milter (DarkChains) Signing
 
-This document describes the two-phase architecture implemented in Postfix to manage sender rewriting (**SRS - Sender Rewriting Scheme**) on forwarded messages. This ensures that the subsequent **Milter (DarkChain/DarkChains)** signing occurs on the correct final envelope, preventing SPF/DKIM breakage.
+This document describes the two-phase architecture implemented in Postfix to manage sender rewriting (**SRS - Sender Rewriting Scheme**) on forwarded messages. This ensures that the subsequent **Milter (DarkChains)** signing occurs on the correct final envelope, preventing SPF/DKIM breakage.
 
 ---
 
@@ -29,7 +29,7 @@ smtpd_recipient_restrictions =
     reject_unauth_destination,
     check_recipient_access hash:/etc/postfix/srs_aliases
 
-# --- Global Milter Configuration (DarkChain) ---
+# --- Global verifier Milter Configuration (DarkChain) ---
 smtpd_milters = unix:/var/spool/DarkChain/sock
 milter_default_action = accept
 milter_protocol = 6
@@ -64,7 +64,7 @@ cleanup_srs unix  n       -       n       -       0       cleanup
     -o sender_canonical_classes=envelope_sender
 
 # ====================================================================
-# PHASE 2 (FOR ALL MAILS): Apply Milter DarkChains on the final 
+# PHASE 2 (FOR ALL MAILS): Apply signer Milter DarkChains on the final 
 # envelope and send
 # ====================================================================
 127.0.0.1:10027 inet n  -       n       -       -       smtpd
