@@ -530,6 +530,18 @@ int cmp_canon_value(struct header_slot *a, struct header_slot *b)
    return la - lb;
 }
 
+/* qsort wrapper for cmp_canon_value over header_slot* arrays.
+ * qsort's unspecified order among equal keys is harmless here:
+ * cmp_canon_value returns 0 only for canonically identical values,
+ * which contribute the same bytes to the hh= hash in any order
+ * (the bubble sort this replaces was equally unstable). */
+int cmp_canon_value_q(const void *a, const void *b)
+{
+   struct header_slot *sa = *(struct header_slot *const *)a;
+   struct header_slot *sb = *(struct header_slot *const *)b;
+   return cmp_canon_value(sa, sb);
+}
+
 /* DKIM2-Mod canonical order: i asc, seq asc, del<new, fr asc */
 int cmp_mod_canonical(const void *a, const void *b)
 {
@@ -587,6 +599,61 @@ char *dc_compute_hh(struct header_slot *headers, int header_cnt)
    if (count > 1)
       qsort(ptrs, count, sizeof(struct header_slot *), cmp_header_hh);
 
+   /* Precompute DKIM2-Mod candidates (new=, fr=1) once: field name,
+    * new= value start and end.  Header values are immutable during this
+    * function, so the extraction never changes across group members —
+    * this replaces the former O(group_members x header_cnt) rescan in
+    * Step A with a single pass.  Capped at DC_MAX_MOD: a structurally
+    * valid chain carries at most DC_MAX_HOPS x DC_MAX_SEQ = 300 such
+    * Mods, and both milters already treat > DC_MAX_MOD as out of spec. */
+   static __thread const struct header_slot *mod_hdrs[DC_MAX_MOD];
+   static __thread char mod_fields[DC_MAX_MOD][MAX_HEADER_NAME];
+   static __thread const char *mod_nv[DC_MAX_MOD];
+   static __thread const char *mod_nv_end[DC_MAX_MOD];
+   int mods_cnt = 0;
+
+   for (int m = 0; m < header_cnt; m++)
+   {
+      if (headers[m].dc_type != DC_HDR_MOD) continue;
+      if (headers[m].is_new != 1) continue;
+      if (headers[m].fr != 1) continue;
+
+      const char *fld = dc_find_tag(headers[m].value, "field");
+      if (!fld) continue;
+
+      const char *nv = dc_find_tag(headers[m].value, "new");
+      if (!nv) continue;
+
+      if (mods_cnt >= DC_MAX_MOD)
+      {
+         syslog(LOG_NOTICE,
+                "DC_SHARED: dc_compute_hh: DKIM2-Mod candidates exceed %d, "
+                "extra Mods ignored for duplicate-group reordering",
+                DC_MAX_MOD);
+         break;
+      }
+
+      int fi = 0;
+      while (*fld && *fld != ';' && *fld != ' ' && *fld != '\t'
+             && fi < MAX_HEADER_NAME - 1)
+         mod_fields[mods_cnt][fi++] = *fld++;
+      mod_fields[mods_cnt][fi] = '\0';
+
+      if (*nv == '"') nv++;
+      /* Find closing quote: last " in the string.
+       * new= is always the last tag, so everything between
+       * the first " and the last " is the value — even if
+       * the value itself contains embedded ".
+       */
+      const char *nv_end = strrchr(nv, '"');
+      if (!nv_end) nv_end = nv + strlen(nv);
+
+      mod_nv[mods_cnt] = nv;
+      mod_nv_end[mods_cnt] = nv_end;
+      mod_hdrs[mods_cnt] = &headers[m];
+      mods_cnt++;
+   }
+
    /* Reorder duplicate groups using DKIM2-Mod */
    int grp_start = 0;
    while (grp_start < count)
@@ -607,43 +674,17 @@ char *dc_compute_hh(struct header_slot *headers, int header_cnt)
          {
             sort_keys[g] = 0;
 
-            for (int m = 0; m < header_cnt; m++)
+            for (int k = 0; k < mods_cnt; k++)
             {
-               if (headers[m].dc_type != DC_HDR_MOD) continue;
-               if (headers[m].is_new != 1) continue;
-               if (headers[m].fr != 1) continue;
-
-               const char *fld = dc_find_tag(headers[m].value, "field");
-               if (!fld) continue;
-
-               char mod_field[MAX_HEADER_NAME] = "";
-               int fi = 0;
-               while (*fld && *fld != ';' && *fld != ' ' && *fld != '\t'
-                      && fi < MAX_HEADER_NAME - 1)
-                  mod_field[fi++] = *fld++;
-               mod_field[fi] = '\0';
-
-               if (strcasecmp(mod_field, ptrs[g]->name) != 0) continue;
-
-               const char *nv = dc_find_tag(headers[m].value, "new");
-               if (!nv) continue;
-               if (*nv == '"') nv++;
-
-               /* Find closing quote: last " in the string.
-                * new= is always the last tag, so everything between
-                * the first " and the last " is the value — even if
-                * the value itself contains embedded ".
-                */
-               const char *nv_end = strrchr(nv, '"');
-               if (!nv_end) nv_end = nv + strlen(nv);
+               if (strcasecmp(mod_fields[k], ptrs[g]->name) != 0) continue;
 
                const char *hv = ptrs[g]->value;
                while (*hv == ' ' || *hv == '\t') hv++;
 
                int match = 1;
-               const char *np = nv;
+               const char *np = mod_nv[k];
                const char *hp = hv;
-               while (np < nv_end)
+               while (np < mod_nv_end[k])
                {
                   if (*hp == '\0' || *np != *hp) { match = 0; break; }
                   np++; hp++;
@@ -651,7 +692,7 @@ char *dc_compute_hh(struct header_slot *headers, int header_cnt)
 
                if (match)
                {
-                  sort_keys[g] = headers[m].hop;
+                  sort_keys[g] = mod_hdrs[k]->hop;
                   break;
                }
             }
@@ -678,13 +719,8 @@ char *dc_compute_hh(struct header_slot *headers, int header_cnt)
          if (zero_end - grp_start > 1 &&
              !dc_is_single_field(ptrs[grp_start]->name))
          {
-            for (int i = grp_start; i < zero_end - 1; i++)
-               for (int j = i + 1; j < zero_end; j++)
-                  if (cmp_canon_value(ptrs[i], ptrs[j]) > 0)
-                  {
-                     struct header_slot *tmp = ptrs[i];
-                     ptrs[i] = ptrs[j]; ptrs[j] = tmp;
-                  }
+            qsort(&ptrs[grp_start], zero_end - grp_start,
+                  sizeof(struct header_slot *), cmp_canon_value_q);
          }
       } /* end if (grp_size > 1) */
 
