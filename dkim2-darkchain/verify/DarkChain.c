@@ -2144,7 +2144,14 @@ inject_result:
    }
 
    /* --- 9. ENFORCEMENT --- */
-   if (ENFORCE && ps->is_localhost == 0)
+   /* Null-sender (DSN/bounce) messages are NEVER rejected regardless
+    * of verification outcome.  RFC 5321 §6.1 loop prevention requires
+    * that bounces always be accepted.  draft-moccia §3.5.1:
+    * "The verifier MUST NOT issue a rejection response to a
+    *  null-sender message regardless of verification outcome."
+    */
+   if (ENFORCE && ps->is_localhost == 0 &&
+       ps->envelope.mail_from[0] != '\0')
    {
       if (strcmp(dkim2_verdict, "fail") == 0 ||
           strcmp(dkim2_verdict, "permerror") == 0)
