@@ -119,7 +119,7 @@ struct context
 
    /* --- Body hashing (relaxed only) --- */
    EVP_MD_CTX *mdctx_body;
-   int  body_size;
+   long long body_size;   /* long long: int would overflow past 2GB */
    int  pending_newlines;
    int  body_has_content;
    int  p_had_space;
@@ -638,12 +638,8 @@ static char *dc_rollback_hh(struct header_slot *headers, int header_cnt, int hop
          if (zero_end - grp_start > 1 &&
              !dc_is_single_field(work[grp_start]->name))
          {
-            for (int i = grp_start; i < zero_end - 1; i++)
-               for (int j = i + 1; j < zero_end; j++)
-                  if (cmp_canon_value(work[i], work[j]) > 0)
-                  {
-                     struct header_slot *tmp = work[i]; work[i] = work[j]; work[j] = tmp;
-                  }
+            qsort(&work[grp_start], zero_end - grp_start,
+                  sizeof(struct header_slot *), cmp_canon_value_q);
          }
       }
       grp_start = grp_end;
@@ -730,6 +726,7 @@ static sfsistat dc_connect(SMFICTX *ctx, char *hostname, _SOCK_ADDR *hostaddr)
       EVP_MD_CTX_free(ps->mdctx_header);
       EVP_MD_CTX_free(ps->mdctx_body);
       free(ps);
+      smfi_setpriv(ctx, NULL);   /* else dc_close would read freed memory */
       return SMFIS_TEMPFAIL;
    }
 
@@ -830,6 +827,8 @@ static sfsistat dc_envfrom(SMFICTX *ctx, char **argv)
       ps->header_vfy = 0;
       ps->envelope_vfy = 0;
       ps->chain_vfy = 0;
+      ps->cpu_ns = 0;
+      ps->dns_ns = 0;
    }
    else
    {
@@ -858,6 +857,8 @@ static sfsistat dc_envfrom(SMFICTX *ctx, char **argv)
       ps->header_vfy = 0;
       ps->envelope_vfy = 0;
       ps->chain_vfy = 0;
+      ps->cpu_ns = 0;
+      ps->dns_ns = 0;
 
       if (ps->headers)
       {
@@ -892,11 +893,21 @@ static sfsistat dc_envfrom(SMFICTX *ctx, char **argv)
    if (!ps->mdctx_body)
    {
       ps->mdctx_body = EVP_MD_CTX_new();
+      if (!ps->mdctx_body)
+      {
+         syslog(LOG_ERR, "DC_ENVFROM: EVP_MD_CTX_new failed (body)");
+         return SMFIS_TEMPFAIL;
+      }
       EVP_DigestInit_ex(ps->mdctx_body, EVP_sha256(), NULL);
    }
    if (!ps->mdctx_header)
    {
       ps->mdctx_header = EVP_MD_CTX_new();
+      if (!ps->mdctx_header)
+      {
+         syslog(LOG_ERR, "DC_ENVFROM: EVP_MD_CTX_new failed (header)");
+         return SMFIS_TEMPFAIL;
+      }
       EVP_DigestInit_ex(ps->mdctx_header, EVP_sha256(), NULL);
    }
 
@@ -980,6 +991,11 @@ static sfsistat dc_header(SMFICTX *ctx, char *headerf, char *headerv)
    slot->name[MAX_HEADER_NAME - 1] = '\0';
 
    unfold_header(headerv);
+   if (strlen(headerv) >= BIG_HEADER_VALUE)
+      syslog(LOG_NOTICE,
+             "DC_HEADER: header '%s' truncated to %d bytes — "
+             "hh= comparison may fail on this message",
+             headerf, BIG_HEADER_VALUE - 1);
    strncpy(slot->value, headerv, BIG_HEADER_VALUE - 1);
    slot->value[BIG_HEADER_VALUE - 1] = '\0';
 
@@ -1008,60 +1024,71 @@ static sfsistat dc_header(SMFICTX *ctx, char *headerf, char *headerv)
          return SMFIS_CONTINUE; /* [ENFORCEMENT]: SMFIS_REJECT */
       }
 
-      int hop = dc_get_hop_index(headerv);
+      /* Determine the structural type by name FIRST.  Only the four
+       * signed chain headers participate in hop numbering and chain
+       * continuity.  Other DKIM2-* headers — notably
+       * DKIM2-Authentication-Results, unsigned and injectable by any
+       * peer, and unknown future extensions — must not raise max_hop
+       * nor set chain_broken: an injected trace header would otherwise
+       * poison the chain (permerror on legitimate mail, reject in
+       * enforcement mode). */
+      int hdr_type = DC_HDR_OTHER;
+      if      (strcasecmp(headerf, "DKIM2-Signature") == 0) hdr_type = DC_HDR_SIG;
+      else if (strcasecmp(headerf, "DKIM2-Sig-mf") == 0)    hdr_type = DC_HDR_MF;
+      else if (strcasecmp(headerf, "DKIM2-Sig-rt") == 0)    hdr_type = DC_HDR_RT;
+      else if (strcasecmp(headerf, "DKIM2-Mod") == 0)       hdr_type = DC_HDR_MOD;
 
-      if (hop < 0)
+      if (hdr_type != DC_HDR_OTHER)
       {
-         ps->chain_broken = 1;
-         syslog(LOG_NOTICE, "DC_HEADER: DKIM2 header without valid i= tag: %s", headerf);
-      }
-      else
-      {
-         slot->hop = hop;
+         int hop = dc_get_hop_index(headerv);
 
-         if (hop > ps->max_hop)
-            ps->max_hop = hop;
-
-         if (strcasecmp(headerf, "DKIM2-Signature") == 0)
+         if (hop < 0)
          {
-            slot->dc_type = DC_HDR_SIG;
+            ps->chain_broken = 1;
+            syslog(LOG_NOTICE, "DC_HEADER: DKIM2 header without valid i= tag: %s", headerf);
          }
-         else if (strcasecmp(headerf, "DKIM2-Sig-mf") == 0)
+         else
          {
-            slot->dc_type = DC_HDR_MF;
-         }
-         else if (strcasecmp(headerf, "DKIM2-Sig-rt") == 0)
-         {
-            slot->dc_type = DC_HDR_RT;
-            slot->v = dc_get_tag_int(headerv, "v");
+            slot->hop = hop;
+            slot->dc_type = hdr_type;
 
-            if (slot->v > DC_MAX_RT)
+            if (hop > ps->max_hop)
+               ps->max_hop = hop;
+
+            if (hdr_type == DC_HDR_RT)
             {
-               ps->chain_broken = 1;
-               syslog(LOG_NOTICE, "DC_HEADER: DKIM2-Sig-rt v=%d exceeds limit", slot->v);
+               slot->v = dc_get_tag_int(headerv, "v");
+
+               if (slot->v > DC_MAX_RT)
+               {
+                  ps->chain_broken = 1;
+                  syslog(LOG_NOTICE, "DC_HEADER: DKIM2-Sig-rt v=%d exceeds limit", slot->v);
+               }
+            }
+            else if (hdr_type == DC_HDR_MOD)
+            {
+               slot->seq = dc_get_tag_int(headerv, "seq");
+               slot->fr  = dc_get_tag_int(headerv, "fr");
+
+               if (slot->seq == 0) slot->seq = 1;
+               if (slot->fr == 0)  slot->fr = 1;
+
+               char probe[16] = "";
+               dc_get_tag_str(headerv, "new", probe, sizeof(probe));
+               slot->is_new = (probe[0] != '\0') ? 1 : 0;
+
+               if (slot->seq > DC_MAX_SEQ || slot->fr > DC_MAX_FR)
+               {
+                  ps->chain_broken = 1;
+                  syslog(LOG_NOTICE, "DC_HEADER: DKIM2-Mod seq=%d fr=%d exceeds limits",
+                         slot->seq, slot->fr);
+               }
             }
          }
-         else if (strcasecmp(headerf, "DKIM2-Mod") == 0)
-         {
-            slot->dc_type = DC_HDR_MOD;
-            slot->seq = dc_get_tag_int(headerv, "seq");
-            slot->fr  = dc_get_tag_int(headerv, "fr");
-
-            if (slot->seq == 0) slot->seq = 1;
-            if (slot->fr == 0)  slot->fr = 1;
-
-            char probe[16] = "";
-            dc_get_tag_str(headerv, "new", probe, sizeof(probe));
-            slot->is_new = (probe[0] != '\0') ? 1 : 0;
-
-            if (slot->seq > DC_MAX_SEQ || slot->fr > DC_MAX_FR)
-            {
-               ps->chain_broken = 1;
-               syslog(LOG_NOTICE, "DC_HEADER: DKIM2-Mod seq=%d fr=%d exceeds limits",
-                      slot->seq, slot->fr);
-            }
-         }
       }
+      /* else: non-structural DKIM2-* (e.g. Authentication-Results):
+       * stored in the reservoir and counted in the byte cap, but with
+       * no effect on hop numbering or chain state. */
    }
 
    ps->header_cnt++;
@@ -1432,12 +1459,24 @@ static sfsistat dc_eom(SMFICTX *ctx)
       {
          if (idx.mod_count < DC_MAX_MOD)
             idx.mod[idx.mod_count++] = h;
-         else
+         else if (!ps->chain_broken)
          {
             ps->chain_broken = 1;
             syslog(LOG_NOTICE, "DC_EOM: DKIM2-Mod count exceeds %d", DC_MAX_MOD);
          }
       }
+   }
+
+   /* Re-check: the index-building loop above can break the chain
+    * (Mod count overflow).  Without this, verification would proceed
+    * on a truncated Mod set and yield "fail" instead of the correct
+    * "permerror". */
+   if (ps->chain_broken)
+   {
+      dkim2_verdict = "permerror";
+      snprintf(dkim2_details, sizeof(dkim2_details),
+               "DKIM2-Mod count exceeds %d", DC_MAX_MOD);
+      goto inject_result;
    }
 
    if (!idx.sig)
@@ -1831,7 +1870,15 @@ static sfsistat dc_eom(SMFICTX *ctx)
          }
          else
          {
+            /* Allocation failure inside dc_compute_hh: transient
+             * condition — do not silently skip the hh= check (which
+             * would let an unverified header set pass), signal
+             * temperror so the sender retries. */
             syslog(LOG_ERR, "DC_EOM: Failed to compute hh= for comparison");
+            dkim2_verdict = "temperror";
+            snprintf(dkim2_details, sizeof(dkim2_details),
+                     "hh= computation failed i=%d", ps->max_hop);
+            goto cleanup_key;
          }
       }
       else
@@ -1998,6 +2045,53 @@ cleanup_key:
 
 inject_result:
 
+   /* --- 7b. STRIP IMPLAUSIBLE DKIM2-AUTHENTICATION-RESULTS --- */
+   /* AR is unsigned trace: any peer can inject it.  max_hop is derived
+    * from signed structural headers only (see dc_header), so an injected
+    * AR cannot poison the chain — but it must not travel further either:
+    * it feeds the signer's Case B downstream.  Legitimate ARs always
+    * satisfy 1 <= i= <= max_hop + 1: each emitter writes at its own next
+    * hop, and a non-signing forwarder cannot push it beyond max_hop + 1
+    * (a second no-key forwarder still sees the same structural max_hop
+    * and writes at the same level again).  Strip anything with a
+    * missing/invalid i= or i= > max_hop + 1 and log it: an implausible
+    * AR is positive evidence of spurious header injection.  Verdict is
+    * NOT affected — an unsigned field must never drive the outcome of a
+    * cryptographic verification.  External boundary only, like the
+    * X-DarkChain-Internal-Status anti-spoofing strip: localhost resubmit
+    * sessions (signer Case B/C input) are trusted and never touched.
+    * Not gated on dc_domain_enabled: a list-only domain re-emits the
+    * message and must not propagate spurious trace either. */
+   if (ps->is_localhost == 0)
+   {
+      int ar_del[MAX_HEADER_COUNT];
+      int ar_del_cnt = 0;
+      int ar_idx = 0;   /* 1-based per-name occurrence, message order */
+
+      for (int j = 0; j < ps->header_cnt; j++)
+      {
+         if (strcasecmp(ps->headers[j].name,
+                        "DKIM2-Authentication-Results") != 0)
+            continue;
+         ar_idx++;
+
+         int ar_hop = dc_get_hop_index(ps->headers[j].value);
+         if (ar_hop < 0 || ar_hop > ps->max_hop + 1)
+         {
+            syslog(LOG_NOTICE,
+                   "DC_EOM: Stripping implausible DKIM2-Auth-Results "
+                   "(occurrence %d, i=%d, max_hop=%d) — spurious injection",
+                   ar_idx, ar_hop, ps->max_hop);
+            ar_del[ar_del_cnt++] = ar_idx;
+         }
+      }
+
+      /* Delete highest milter index first: smfi_chgheader indexes
+       * occurrences per name and deletions shift later indices. */
+      for (int k = ar_del_cnt - 1; k >= 0; k--)
+         smfi_chgheader(ctx, "DKIM2-Authentication-Results", ar_del[k], NULL);
+   }
+
    /* --- 8. INJECT DKIM2-AUTHENTICATION-RESULTS --- */
    /* Only inject if this host is DKIM2-enabled for the recipient domain.
     * Inbound MTA sessions are per recipient domain, so rcpt_to[0] is
@@ -2036,11 +2130,11 @@ inject_result:
       char hs_val[128];
 
       if (ps->body_size < 1024)
-         snprintf(hs_val, sizeof(hs_val), "%d bytes", ps->body_size);
+         snprintf(hs_val, sizeof(hs_val), "%lld bytes", ps->body_size);
       else if (ps->body_size < 1048576)
-         snprintf(hs_val, sizeof(hs_val), "%d Kbytes", ps->body_size / 1024);
+         snprintf(hs_val, sizeof(hs_val), "%lld Kbytes", ps->body_size / 1024);
       else
-         snprintf(hs_val, sizeof(hs_val), "%d Mbytes", ps->body_size / 1048576);
+         snprintf(hs_val, sizeof(hs_val), "%lld Mbytes", ps->body_size / 1048576);
 
       snprintf(h_val, sizeof(h_val), "%s; hops=%d; d=%s; %s; cpu=%s; dns=%s; other=%s",
                dkim2_verdict, next_hop, signing_domain, hs_val,
@@ -2173,8 +2267,11 @@ static void dc_usage(const char *prog)
 void cleanup_and_exit(int sig)
 {
    (void)sig;
-   write(2, "Signal received, exiting...\n", 28);
-   exit(0);
+   static const char msg[] = "Signal received, exiting...\n";
+   write(2, msg, sizeof(msg) - 1);
+   /* _exit, not exit: exit() runs atexit handlers and flushes stdio,
+    * which is not async-signal-safe inside a signal handler. */
+   _exit(0);
 }
 
 int main(int argc, char *argv[])
@@ -2248,7 +2345,10 @@ int main(int argc, char *argv[])
          fprintf(stderr, "setgid: %s\n", strerror(errno));
          return 1;
       }
-      if (seteuid(pw->pw_uid) || setuid(pw->pw_uid))
+      /* setuid MUST come first: as root it sets ruid/euid/suid at once.
+       * The reverse order (seteuid first) drops the effective CAP_SETUID
+       * and the subsequent setuid fails with EPERM on Linux. */
+      if (setuid(pw->pw_uid) || seteuid(pw->pw_uid))
       {
          fprintf(stderr, "setuid: %s\n", strerror(errno));
          return 1;
@@ -2270,6 +2370,15 @@ int main(int argc, char *argv[])
    if (!b_fail && daemon(0, 0))
    {
       fprintf(stderr, "daemon: %s\n", strerror(errno));
+      i_ret = 1;
+      goto done;
+   }
+
+   /* Setup failed (setconn/register): do not enter smfi_main, which
+    * would fail obscurely; exit with a nonzero status instead. */
+   if (b_fail)
+   {
+      i_ret = 1;
       goto done;
    }
 
