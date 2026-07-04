@@ -95,7 +95,7 @@ struct context
 
    /* Body hash (relaxed) */
    EVP_MD_CTX *mdctx_body;
-   int  body_size;
+   long long body_size;   /* long long: int would overflow past 2GB */
    int  pending_newlines;
    int  body_has_content;
    int  p_had_space;
@@ -414,6 +414,11 @@ static sfsistat dcs_envfrom(SMFICTX *ctx, char **argv)
    if (!ps->mdctx_body)
    {
       ps->mdctx_body = EVP_MD_CTX_new();
+      if (!ps->mdctx_body)
+      {
+         syslog(LOG_ERR, "DCS_ENVFROM: EVP_MD_CTX_new failed");
+         return SMFIS_TEMPFAIL;
+      }
       EVP_DigestInit_ex(ps->mdctx_body, EVP_sha256(), NULL);
    }
 
@@ -554,6 +559,11 @@ static sfsistat dcs_header(SMFICTX *ctx, char *headerf, char *headerv)
    strncpy(slot->name, headerf, MAX_HEADER_NAME - 1);
    slot->name[MAX_HEADER_NAME - 1] = '\0';
    unfold_header(headerv);
+   if (strlen(headerv) >= BIG_HEADER_VALUE)
+      syslog(LOG_NOTICE,
+             "DCS_HEADER: header '%s' truncated to %d bytes — "
+             "hh= will be computed on the truncated value",
+             headerf, BIG_HEADER_VALUE - 1);
    strncpy(slot->value, headerv, BIG_HEADER_VALUE - 1);
    slot->value[BIG_HEADER_VALUE - 1] = '\0';
    slot->used_for_signature = 0;
@@ -583,12 +593,12 @@ static sfsistat dcs_header(SMFICTX *ctx, char *headerf, char *headerv)
             slot->dc_type = DC_HDR_MOD;
             if (hop > ps->max_prev_hop)
                ps->max_prev_hop = hop;
-            const char *v;
-            v = dc_find_tag(headerv, "seq");
-            if (v) slot->seq = atoi(v);
-            v = dc_find_tag(headerv, "fr");
-            if (v) slot->fr = atoi(v);
-            v = dc_find_tag(headerv, "new");
+            /* dc_get_tag_int, like the verifier: missing, non-numeric
+             * or negative values normalize to 0 (then to 1 below);
+             * raw atoi would let negatives through. */
+            slot->seq = dc_get_tag_int(headerv, "seq");
+            slot->fr  = dc_get_tag_int(headerv, "fr");
+            const char *v = dc_find_tag(headerv, "new");
             slot->is_new = (v != NULL) ? 1 : 0;
 
             if (slot->seq == 0) slot->seq = 1;
@@ -699,8 +709,13 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    struct context *ps = (struct context *)smfi_getpriv(ctx);
    if (!ps) return SMFIS_CONTINUE;
 
-   /* Always strip X-DarkChain-Internal-Status */
-   smfi_chgheader(ctx, "X-DarkChain-Internal-Status", 1, NULL);
+   /* Always strip X-DarkChain-Internal-Status — ALL occurrences.
+    * internal_status_count > 1 means injection (verdict already forced
+    * to permerror in dcs_header); the surviving copies must not leak
+    * downstream either.  Delete highest index first: smfi_chgheader
+    * indexes occurrences per name and deletions shift later indices. */
+   for (int is_k = ps->internal_status_count; is_k >= 1; is_k--)
+      smfi_chgheader(ctx, "X-DarkChain-Internal-Status", is_k, NULL);
 
    struct timespec ts_start, ts_end;
    clock_gettime(CLOCK_MONOTONIC, &ts_start);
@@ -754,12 +769,19 @@ static sfsistat dcs_eom(SMFICTX *ctx)
 
       /* Verdict: propagate from the DKIM2-Authentication-Results of the
        * PREVIOUS hop, i.e. at i = N-1.  In Case B the prior AR was emitted
-       * by the pre-list signer at its own signing level (N-1); the list
-       * manager then added a DKIM2-Mod at level N.  The anchor must be N-1,
-       * NOT max_prev_hop (which equals N when that Mod is present) and NOT
-       * the highest i= among AR records (an unsigned, injectable field).
+       * by the previous hop's verifier or signer, depending on geometry:
+       * in full attestation mode (deployment profile Case 2) by the
+       * pre-list signer at its own signing level (N-1); in the two-hop
+       * mode (Case 1) by our own inbound verifier at max_hop+1 = N-1.
+       * The list manager then added a DKIM2-Mod at level N.  The anchor
+       * must be N-1, NOT max_prev_hop (which equals N when that Mod is
+       * present) and NOT the highest i= among AR records (an unsigned,
+       * injectable field).
        * N-1 derives from found_prev_sigs (signed chain), so a peer cannot
        * hijack selection by injecting an AR at an arbitrary i=.
+       * The inbound verifier additionally strips ARs with i= > max_hop+1
+       * at the external boundary, so implausible injected ARs never reach
+       * this code on a DarkChain-fronted host.
        *
        *   - no AR at N-1            -> "none"   (legitimate in transition:
        *                                          a prior hop may not emit AR)
@@ -943,25 +965,41 @@ static sfsistat dcs_eom(SMFICTX *ctx)
          }
 
          char new_mailfrom[1024];
-         snprintf(new_mailfrom, sizeof(new_mailfrom),
+         int nm_len = snprintf(new_mailfrom, sizeof(new_mailfrom),
                   "SRS0=%s=%s=%s=%s@%s",
                   hhh, tt, mf_domain, localpart, dk->domain);
 
-         syslog(LOG_INFO, "DCS_EOM: Relay rewriting MAIL FROM: '%s' -> '%s'",
-                ps->envelope.mail_from, new_mailfrom);
-
-         if (smfi_chgfrom(ctx, new_mailfrom, NULL) == MI_FAILURE)
+         /* The rewritten address must fit in envelope.mail_from
+          * (DC_MAX_ADDR), which feeds the signed mf= header.  A silent
+          * truncation there would make mf= diverge from the actual
+          * envelope and guarantee a fail at the next hop. */
+         if (nm_len < 0 || nm_len >= (int)sizeof(new_mailfrom) ||
+             nm_len >= DC_MAX_ADDR)
          {
-            syslog(LOG_WARNING,
-                   "DCS_EOM: smfi_chgfrom not supported by MTA. "
-                   "Configure SRS at MTA level for forwarding.");
+            syslog(LOG_NOTICE,
+                   "DCS_EOM: SRS rewrite skipped: rewritten address too long "
+                   "(%d bytes, max %d). Keeping original envelope.",
+                   nm_len, DC_MAX_ADDR - 1);
             /* Continue with original envelope — mf= won't align with d= */
          }
          else
          {
-            /* Update our copy of MAIL FROM for mf= header */
-            securecpy(ps->envelope.mail_from, new_mailfrom,
-                      sizeof(ps->envelope.mail_from));
+            syslog(LOG_INFO, "DCS_EOM: Relay rewriting MAIL FROM: '%s' -> '%s'",
+                   ps->envelope.mail_from, new_mailfrom);
+
+            if (smfi_chgfrom(ctx, new_mailfrom, NULL) == MI_FAILURE)
+            {
+               syslog(LOG_WARNING,
+                      "DCS_EOM: smfi_chgfrom not supported by MTA. "
+                      "Configure SRS at MTA level for forwarding.");
+               /* Continue with original envelope — mf= won't align with d= */
+            }
+            else
+            {
+               /* Update our copy of MAIL FROM for mf= header */
+               securecpy(ps->envelope.mail_from, new_mailfrom,
+                         sizeof(ps->envelope.mail_from));
+            }
          }
       }
    }
@@ -1164,6 +1202,12 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    if (is_ed25519)
    {
       EVP_MD_CTX *sctx = EVP_MD_CTX_new();
+      if (!sctx)
+      {
+         syslog(LOG_ERR, "DCS_EOM: EVP_MD_CTX_new failed (Ed25519)");
+         free(sign_buf); free(bh_b64); free(hh_b64); if (rt_values) free(rt_values);
+         return SMFIS_TEMPFAIL;
+      }
       if (EVP_DigestSignInit(sctx, NULL, NULL, NULL, dk->pkey) != 1)
       {
          syslog(LOG_ERR, "DCS_EOM: DigestSignInit Ed25519 failed");
@@ -1202,6 +1246,12 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    else
    {
       EVP_MD_CTX *sctx = EVP_MD_CTX_new();
+      if (!sctx)
+      {
+         syslog(LOG_ERR, "DCS_EOM: EVP_MD_CTX_new failed (RSA)");
+         free(sign_buf); free(bh_b64); free(hh_b64); if (rt_values) free(rt_values);
+         return SMFIS_TEMPFAIL;
+      }
       if (EVP_DigestSignInit(sctx, NULL, EVP_sha256(), NULL, dk->pkey) != 1)
       {
          unsigned long err = ERR_get_error();
@@ -1265,7 +1315,7 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    }
 
    char xsigned[100] = "";
-   snprintf (xsigned, sizeof(xsigned), "DarkChain 0.5 i=%d", N);
+   snprintf (xsigned, sizeof(xsigned), "DarkChain 0.6 i=%d", N);
    smfi_addheader(ctx, "X-Signed", xsigned);
 
    /* Timing */
@@ -1276,11 +1326,11 @@ static sfsistat dcs_eom(SMFICTX *ctx)
 
    char hs_val[128];
    if (ps->body_size < 1024)
-      snprintf(hs_val, sizeof(hs_val), "%d bytes", ps->body_size);
+      snprintf(hs_val, sizeof(hs_val), "%lld bytes", ps->body_size);
    else if (ps->body_size < 1048576)
-      snprintf(hs_val, sizeof(hs_val), "%d Kbytes", ps->body_size / 1024);
+      snprintf(hs_val, sizeof(hs_val), "%lld Kbytes", ps->body_size / 1024);
    else
-      snprintf(hs_val, sizeof(hs_val), "%d Mbytes", ps->body_size / 1048576);
+      snprintf(hs_val, sizeof(hs_val), "%lld Mbytes", ps->body_size / 1048576);
 
    syslog(LOG_INFO, "DCS_EOM: Signed i=%d d=%s s=%s %s; %s; cpu=%s",
           N, dk->domain, dk->selector, ALGORITHM, hs_val, cpu_buf);
@@ -1347,8 +1397,11 @@ static void dcs_usage(const char *prog)
 void cleanup_and_exit(int sig)
 {
    (void)sig;
-   write(2, "Signal received, exiting...\n", 28);
-   exit(0);
+   static const char msg[] = "Signal received, exiting...\n";
+   write(2, msg, sizeof(msg) - 1);
+   /* _exit, not exit: exit() runs atexit handlers and flushes stdio,
+    * which is not async-signal-safe inside a signal handler. */
+   _exit(0);
 }
 
 int main(int argc, char *argv[])
@@ -1448,7 +1501,10 @@ int main(int argc, char *argv[])
          fprintf(stderr, "setgid: %s\n", strerror(errno));
          return 1;
       }
-      if (seteuid(pw->pw_uid) || setuid(pw->pw_uid))
+      /* setuid MUST come first: as root it sets ruid/euid/suid at once.
+       * The reverse order (seteuid first) drops the effective CAP_SETUID
+       * and the subsequent setuid fails with EPERM on Linux. */
+      if (setuid(pw->pw_uid) || seteuid(pw->pw_uid))
       {
          fprintf(stderr, "setuid: %s\n", strerror(errno));
          return 1;
@@ -1470,6 +1526,15 @@ int main(int argc, char *argv[])
    if (!b_fail && daemon(0, 0))
    {
       fprintf(stderr, "daemon: %s\n", strerror(errno));
+      i_ret = 1;
+      goto done;
+   }
+
+   /* Setup failed (setconn/register): do not enter smfi_main, which
+    * would fail obscurely; exit with a nonzero status instead. */
+   if (b_fail)
+   {
+      i_ret = 1;
       goto done;
    }
 
