@@ -28,6 +28,7 @@
 #define MY_SERVER         "dns.itb.it"
 #define DOMAIN            "itb.it"
 #define DEBUG             0
+#define DEBUG1            0
 #define MAX_DOMAIN_SIZE   256
 #define MAX_HEADER_COUNT  800
 #define MAX_CAPACITY      200
@@ -697,7 +698,7 @@ sfsistat das_eom(SMFICTX *ctx)
       free (b64_signature2);
       smfi_addheader(ctx, "ARC-Seal", as_header_top_inj);
       if (!ps_context->has_darc_xsigned)
-         smfi_addheader(ctx, "X-Signed", "DarkARC v1.0");
+         smfi_addheader(ctx, "X-Signed", "DarkARC v1.1");
    }
    return SMFIS_CONTINUE;
 }
@@ -1108,17 +1109,52 @@ static sfsistat das_helo(SMFICTX *ctx, char *pc_helohost)
 sfsistat das_envrcpt(SMFICTX *ctx, char **argv) {
     // Try to read the mailer assigned to this recipient
     const char *mailer = smfi_getsymval(ctx, "{rcpt_mailer}");
+   if (DEBUG1)
+   {
+      static const char *dbg_macros[] =
+      {
+         "{rcpt_addr}", "{rcpt_host}", "{rcpt_mailer}",
+         "{mail_addr}", "{mail_host}", "{mail_mailer}",
+         "i", "j", "{client_addr}", "{daemon_name}", NULL
+      };
+      for (int dbg_i = 0; dbg_macros[dbg_i]; dbg_i++)
+      {
+         const char *dbg_v = smfi_getsymval(ctx, (char *)dbg_macros[dbg_i]);
+         syslog(LOG_INFO, "DAS_MACRO[ENVRCPT] argv0='%s' %s = %s",
+              (argv && argv[0]) ? argv[0] : "NULL",
+              dbg_macros[dbg_i], dbg_v ? dbg_v : "(NULL)");
+      }
+   }
+
+
    if (NOLOCALSIGN)
    {
-      if (mailer != NULL) 
+      struct context *ps_context = (struct context *)smfi_getpriv(ctx);
+
+      if (mailer != NULL)
       {
           // Log the value to see what Sendmail returns in this setup
-          // Tipicamente: "local", "cyrus", "dovecot", "uucp", o "smtp"
+          // Typically: "local", "cyrus", "dovecot", "uucp", or "smtp"
           syslog(LOG_DEBUG, "DAS_ENVRCPT: rcpt_mailer per %s è %s", argv[0], mailer);
-  
-          // If the mailer is not 'esmtp' or 'smtp', it is likely a local delivery
-          if (strcmp(mailer, "smtp") != 0 && strcmp(mailer, "esmtp") != 0) {
-              return SMFIS_ACCEPT; // Skip signing, it is our own mail!
+
+          // A non-smtp mailer normally means local delivery. But a *local*
+          // mailer only means "delivered on this host" when the message also
+          // originated here (is_localhost==1). When the message arrived from
+          // outside (is_localhost==0) and the recipient resolves to a local
+          // mailer, it is an alias that will be expanded and re-sent to an
+          // external address — Sendmail has not expanded the alias yet at
+          // ENVRCPT time. In that case we must NOT skip: the message is
+          // leaving this host and must be ARC-sealed.
+          if (strcmp(mailer, "smtp") != 0 && strcmp(mailer, "esmtp") != 0)
+          {
+              if (ps_context != NULL && ps_context->is_localhost == 0)
+              {
+                  syslog(LOG_DEBUG,
+                     "DAS_ENVRCPT: local mailer but external origin — "
+                     "alias forward, will sign");
+                  return SMFIS_CONTINUE;
+              }
+              return SMFIS_ACCEPT; // Skip signing, it is our own local mail
           }
       }
    }
