@@ -1610,12 +1610,33 @@ static sfsistat dc_eom(SMFICTX *ctx)
 
       clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
-      if (dns_ok < 0 || dns_key[0] == '\0')
+      if (dns_ok == -2)
+      {
+         dkim2_verdict = "permerror";
+         snprintf(dkim2_details, sizeof(dkim2_details),
+                  "no key record %s._domainkey.%s", sig_s, sig_d);
+         syslog(LOG_NOTICE, "DC_EOM: No key record for %s._domainkey.%s", sig_s, sig_d);
+         goto inject_result;
+      }
+
+      if (dns_ok < 0)
       {
          dkim2_verdict = "temperror";
          snprintf(dkim2_details, sizeof(dkim2_details),
                   "DNS lookup failed %s._domainkey.%s", sig_s, sig_d);
-         syslog(LOG_ERR, "DC_EOM: DNS key not found for %s._domainkey.%s", sig_s, sig_d);
+         syslog(LOG_ERR, "DC_EOM: DNS lookup failed for %s._domainkey.%s", sig_s, sig_d);
+         goto inject_result;
+      }
+
+      if (dns_key[0] == '\0')
+      {
+         /* Successful lookup, empty p= : revoked key — permanent
+          * condition per RFC 6376 semantics, not a temperror. */
+         dkim2_verdict = "permerror";
+         snprintf(dkim2_details, sizeof(dkim2_details),
+                  "key revoked %s._domainkey.%s", sig_s, sig_d);
+         syslog(LOG_NOTICE, "DC_EOM: Revoked key (empty p=) for %s._domainkey.%s",
+                sig_s, sig_d);
          goto inject_result;
       }
 
