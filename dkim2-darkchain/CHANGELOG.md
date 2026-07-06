@@ -30,7 +30,7 @@ log-only mode unaffected.
 ### Postfix compatibility (Case A)
 The signer's hop-classification no longer keys Case A (inbound/relay) on the
 connection origin (`is_localhost`). When a message is re-injected through a
-loopback cascade â€” as required on Postfix to apply SRS before signing â€” the
+loopback cascade - as required on Postfix to apply SRS before signing - the
 client address is always `127.0.0.1`, which previously misclassified relayed
 mail as locally originated. Case A is now driven by the presence of a verifier
 verdict, so a message that carries one is treated as relay regardless of the
