@@ -1,9 +1,31 @@
 # Changelog DarkChain / DarkChains (DKIM2)
 
 
-## [0.5 - 30/06/2026]
+## [0.6 - 06/07/2026]
 
-## [Unreleased]
+Hardening pass over both milters. No wire-format changes; transitional
+log-only mode unaffected.
+
+- **Chain semantics.** Hop numbering and chain state now derive only from
+  the four signed DKIM2 headers: unsigned trace records
+  (DKIM2-Authentication-Results) can no longer break or inflate a valid
+  chain, and implausible inbound ARs are stripped and logged at the
+  external boundary. ARs remain purely informational; verdicts depend only
+  on signed material and the envelope.
+- **Verdict classes corrected.** Out-of-spec Mod count now yields permerror
+  (was fail); missing or revoked DNS key yields permerror (was temperror);
+  a failed hh= computation yields temperror instead of skipping the check.
+- **Reliability.** Fixed privilege drop when started as root; DNS lookups
+  now have bounded timeouts (DarkARC inherits them via libdark); SRS
+  rewrites too long for the signed mf= are skipped instead of silently
+  truncated; internal status header stripped in all copies; cleaner error
+  paths (exit codes, signal safety, allocation checks) and better
+  diagnostics (header-truncation logging, per-message timing stats).
+- **Performance.** Duplicate-header reordering is no longer quadratic
+  (~37x faster on the adversarial worst case); the computed hh= is
+  verified unchanged byte-for-byte.
+
+## [0.5 - 30/06/2026]
 
 ### Postfix compatibility (Case A)
 The signer's hop-classification no longer keys Case A (inbound/relay) on the
