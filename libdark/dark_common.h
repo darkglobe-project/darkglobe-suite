@@ -49,6 +49,12 @@
 #define BIG_BUFFER         4096
 #define BODY_BUF_SIZE     32768
 #define MAX_PUB_KEY        1024
+
+/* Resolver bounds for DNS key lookups (see get_dns_arc_pubkey).
+ * Default resolver settings (retrans 5s, retry 2, per nameserver) can
+ * block a milter thread for tens of seconds on upstream DNS failure. */
+#define DNS_RETRANS           2   /* seconds per attempt */
+#define DNS_RETRY             2   /* attempts */
 #ifndef EVP_MAX_MD_SIZE
 #define EVP_MAX_MD_SIZE      64
 #endif

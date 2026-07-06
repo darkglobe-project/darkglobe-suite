@@ -11,6 +11,7 @@
 
 #include "dark_common.h"
 #include <resolv.h>
+#include <netdb.h>   /* HOST_NOT_FOUND, NO_DATA for res_h_errno */
 
 
 char *encode_base64_hash(const unsigned char *bin_data, int bin_len)
@@ -128,15 +129,43 @@ EVP_PKEY *decode_dns_key(const char *base64_key, bool is_ed25519)
    return pkey;
 }
 
+/* DNS key lookup with bounded timeouts.
+ * Per-call resolver state (res_ninit/res_nclose): parsing resolv.conf
+ * costs microseconds against a network RTT, and avoids leaking the
+ * extended storage glibc allocates inside __res_state — a __thread
+ * state would leak it on every libmilter thread exit (one per
+ * connection), since only res_nclose frees it.
+ * Return values:
+ *    1  key found (pubkey_out filled; empty p= means revoked key)
+ *   -1  transient failure (timeout / SERVFAIL / network / unparsable
+ *       answer) — caller should treat as temperror
+ *   -2  permanent failure (NXDOMAIN / NODATA / valid answer without a
+ *       usable p= tag) — caller should treat as permerror */
 int get_dns_arc_pubkey(const char *d, const char *s, char *pubkey_out, size_t out_len)
 {
    char query[512];
    unsigned char answer[BIG_BUFFER];
    int len;
+   struct __res_state state;
+
    snprintf(query, sizeof(query), "%s._domainkey.%s", s, d);
 
-   len = res_query(query, C_IN, T_TXT, answer, sizeof(answer));
-   if (len < 0) return -1;
+   memset(&state, 0, sizeof(state));
+   if (res_ninit(&state) != 0)
+      return -1;
+
+   state.retrans = DNS_RETRANS;
+   state.retry   = DNS_RETRY;
+
+   len = res_nquery(&state, query, C_IN, T_TXT, answer, sizeof(answer));
+   if (len < 0)
+   {
+      int rc = (state.res_h_errno == HOST_NOT_FOUND ||
+                state.res_h_errno == NO_DATA) ? -2 : -1;
+      res_nclose(&state);
+      return rc;
+   }
+   res_nclose(&state);
 
    ns_msg msg;
    if (ns_initparse(answer, len, &msg) < 0) return -1;
@@ -192,7 +221,9 @@ int get_dns_arc_pubkey(const char *d, const char *s, char *pubkey_out, size_t ou
          }
       }
    }
-   return -1;
+   /* Valid answer, but no TXT record carries a usable p= tag:
+    * permanent condition — retrying will not change it. */
+   return -2;
 }
 
 EVP_PKEY *load_private_key(const char *path)
