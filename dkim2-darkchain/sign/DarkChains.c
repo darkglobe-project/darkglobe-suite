@@ -926,8 +926,16 @@ static sfsistat dcs_eom(SMFICTX *ctx)
     *
     * Skip for local delivery — no need to rewrite the envelope
     * when the message is not leaving this server.
+    *
+    * Gate on !is_local_delivery only (not N > 1): a single-hop forward of
+    * external mail (N = 1) via virtusertable also needs mf/d alignment. This
+    * relies on is_local_delivery being set to 0 ONLY when a remote mailer
+    * (smtp/esmtp) is seen — i.e. destination is certainly external. A "local"
+    * mailer (final local mailbox, or an alias not yet expanded) keeps
+    * is_local_delivery=1 and is deliberately NOT rewritten: we must never
+    * SRS-rewrite the envelope of a message being delivered to a local mailbox.
     */
-   if (N > 1 && !ps->is_local_delivery)
+   if (!ps->is_local_delivery)
    {
       /* Extract domain from current MAIL FROM */
       const char *at = strchr(ps->envelope.mail_from, '@');
