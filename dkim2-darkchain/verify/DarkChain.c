@@ -67,10 +67,22 @@
 
 #define OCONN           "unix:/var/spool/DarkChain/sock"
 #define USER            "smmsp"
-#define LOGLEVEL        LOG_ERR
+#define LOGLEVEL        LOG_NOTICE
 #define SYSLOG_FACILITY LOG_DAEMON
 #define DEBUG           0
 #define ENFORCE         0        /* 0=log only, 1=reject fail/permerror */
+
+/* Parse -l argument to syslog level */
+static int parse_loglevel(const char *s)
+{
+   if (strcasecmp(s, "debug")   == 0) return LOG_DEBUG;
+   if (strcasecmp(s, "info")    == 0) return LOG_INFO;
+   if (strcasecmp(s, "notice")  == 0) return LOG_NOTICE;
+   if (strcasecmp(s, "warning") == 0) return LOG_WARNING;
+   if (strcasecmp(s, "err")     == 0) return LOG_ERR;
+   if (strcasecmp(s, "error")   == 0) return LOG_ERR;
+   return -1;
+}
 
 /* Header hash exclusion config path */
 #define DC_HH_EXCLUDE_CONF  "/etc/DarkChain/hh_exclude.conf"
@@ -964,7 +976,7 @@ static sfsistat dc_header(SMFICTX *ctx, char *headerf, char *headerv)
       if (strcasecmp(headerf, "X-DarkChain-Internal-Status") == 0)
       {
          smfi_chgheader(ctx, "X-DarkChain-Internal-Status", 1, NULL);
-         syslog(LOG_NOTICE, "DC_HEADER: Stripped spoofed internal header from external sender");
+         syslog(LOG_WARNING, "DC_HEADER: Stripped spoofed internal header from external sender");
          return SMFIS_CONTINUE;
       }
    }
@@ -1624,7 +1636,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
          dkim2_verdict = "temperror";
          snprintf(dkim2_details, sizeof(dkim2_details),
                   "DNS lookup failed %s._domainkey.%s", sig_s, sig_d);
-         syslog(LOG_ERR, "DC_EOM: DNS lookup failed for %s._domainkey.%s", sig_s, sig_d);
+         syslog(LOG_NOTICE, "DC_EOM: DNS lookup failed for %s._domainkey.%s", sig_s, sig_d);
          goto inject_result;
       }
 
@@ -2288,7 +2300,13 @@ static void dc_cleanup_message(struct context *priv)
 
 static void dc_usage(const char *prog)
 {
-   fprintf(stderr, "usage: %s [-u user] [-p pipe]\n", prog);
+   fprintf(stderr, "usage: %s [-u user] [-p socket] [-l level] [-m umask] [-f] [-L]\n"
+                   "  -u user    Run as user (default: smmsp)\n"
+                   "  -p socket  Milter socket (default: unix:/var/spool/DarkChain/sock)\n"
+                   "  -l level   Log level: debug|info|notice|warning|err (default: notice)\n"
+                   "  -m umask   Socket umask in octal (default: 0177)\n"
+                   "  -f         Run in foreground (no daemon)\n"
+                   "  -L         Log to stderr (in addition to syslog)\n", prog);
    exit(1);
 }
 
@@ -2305,7 +2323,58 @@ void cleanup_and_exit(int sig)
 int main(int argc, char *argv[])
 {
    tzset();
-   openlog("DarkChain", LOG_PID | LOG_NDELAY, SYSLOG_FACILITY);
+
+   int i_get = 0, i_ret = 0;
+   const char *pc_ofile = NULL;
+   bool b_fail = 0;
+   int loglevel = LOGLEVEL;
+   int foreground = 0;
+   int log_stderr = 0;
+   mode_t sock_umask = 0177;
+
+   while ((i_get = getopt(argc, argv, "p:u:l:m:fLh")) != -1)
+   {
+      switch (i_get)
+      {
+         case 'p':
+            pc_oconn = optarg;
+            break;
+         case 'u':
+            pc_user = optarg;
+            break;
+         case 'l':
+         {
+            int lv = parse_loglevel(optarg);
+            if (lv < 0)
+            {
+               fprintf(stderr, "Invalid loglevel: %s "
+                       "(use debug|info|notice|warning|err)\n", optarg);
+               return 1;
+            }
+            loglevel = lv;
+            break;
+         }
+         case 'm':
+            sock_umask = (mode_t)strtol(optarg, NULL, 8);
+            break;
+         case 'f':
+            foreground = 1;
+            break;
+         case 'L':
+            log_stderr = 1;
+            break;
+         default:
+            dc_usage(argv[0]);
+      }
+   }
+
+   /* Open syslog with optional stderr mirroring */
+   {
+      int log_flags = LOG_PID | LOG_NDELAY;
+      if (log_stderr) log_flags |= LOG_PERROR;
+      openlog("DarkChain", log_flags, SYSLOG_FACILITY);
+   }
+   setlogmask(LOG_UPTO(loglevel));
 
    /* Get local FQDN at runtime */
    {
@@ -2331,27 +2400,8 @@ int main(int argc, char *argv[])
          securecpy(my_hostname, "localhost", sizeof(my_hostname));
    }
 
-   /* Load DKIM2-enabled domains: gate DKIM2-AR injection on membership. */
+   /* Load DKIM2-enabled domains */
    dc_load_domains(DC_DOMAINS_CONF);
-
-   int i_get = 0, i_ret = 0;
-   const char *pc_ofile = NULL;
-   bool b_fail = 0;
-
-   while ((i_get = getopt(argc, argv, "p:u:")) != -1)
-   {
-      switch (i_get)
-      {
-         case 'p':
-            pc_oconn = optarg;
-            break;
-         case 'u':
-            pc_user = optarg;
-            break;
-         default:
-            dc_usage(argv[0]);
-      }
-   }
 
    if (!strncmp(pc_oconn, "unix:", 5))
       pc_ofile = pc_oconn + 5;
@@ -2395,7 +2445,7 @@ int main(int argc, char *argv[])
       goto done;
    }
 
-   if (!b_fail && daemon(0, 0))
+   if (!b_fail && !foreground && daemon(0, 0))
    {
       fprintf(stderr, "daemon: %s\n", strerror(errno));
       i_ret = 1;
@@ -2410,7 +2460,7 @@ int main(int argc, char *argv[])
       goto done;
    }
 
-   umask(0177);
+   umask(sock_umask);
    signal(SIGPIPE, SIG_IGN);
    signal(SIGTERM, cleanup_and_exit);
    signal(SIGINT,  cleanup_and_exit);
@@ -2423,7 +2473,7 @@ int main(int argc, char *argv[])
    i_ret = smfi_main();
 
    if (i_ret != MI_SUCCESS)
-      syslog(LOGLEVEL, "[ERROR] DarkChain terminated due to a fatal error");
+      syslog(LOG_ERR, "[ERROR] DarkChain terminated due to a fatal error");
 
 done:
    return i_ret;

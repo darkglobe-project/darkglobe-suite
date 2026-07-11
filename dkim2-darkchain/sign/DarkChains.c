@@ -51,9 +51,21 @@
 #define DEFAULT_KEYPATH "/etc/DarkChains/default.private"
 /* --- END DEFAULT DOMAIN --- */
 #define USER            "smmsp"
-#define LOGLEVEL        LOG_ERR
+#define LOGLEVEL        LOG_NOTICE
 #define SYSLOG_FACILITY LOG_DAEMON
 #define DEBUG           0
+
+/* Parse -l argument to syslog level */
+static int parse_loglevel(const char *s)
+{
+   if (strcasecmp(s, "debug")   == 0) return LOG_DEBUG;
+   if (strcasecmp(s, "info")    == 0) return LOG_INFO;
+   if (strcasecmp(s, "notice")  == 0) return LOG_NOTICE;
+   if (strcasecmp(s, "warning") == 0) return LOG_WARNING;
+   if (strcasecmp(s, "err")     == 0) return LOG_ERR;
+   if (strcasecmp(s, "error")   == 0) return LOG_ERR;
+   return -1;
+}
 #define ALGORITHM       "rsa-sha256"   /* or "ed25519-sha256" */
 
 #define DC_DOMAINS_CONF "/etc/DarkChains/domains.conf"
@@ -1337,7 +1349,7 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    }
 
    char xsigned[100] = "";
-   snprintf (xsigned, sizeof(xsigned), "DarkChain 0.6 i=%d", N);
+   snprintf (xsigned, sizeof(xsigned), "DarkChain 0.7 i=%d", N);
    smfi_addheader(ctx, "X-Signed", xsigned);
 
    /* Timing */
@@ -1412,7 +1424,13 @@ static sfsistat dcs_negotiate(SMFICTX *ctx,
 
 static void dcs_usage(const char *prog)
 {
-   fprintf(stderr, "usage: %s [-u user] [-p pipe]\n", prog);
+   fprintf(stderr, "usage: %s [-u user] [-p socket] [-l level] [-m umask] [-f] [-L]\n"
+                   "  -u user    Run as user (default: smmsp)\n"
+                   "  -p socket  Milter socket (default: unix:/var/spool/DarkChains/sock)\n"
+                   "  -l level   Log level: debug|info|notice|warning|err (default: notice)\n"
+                   "  -m umask   Socket umask in octal (default: 0177)\n"
+                   "  -f         Run in foreground (no daemon)\n"
+                   "  -L         Log to stderr (in addition to syslog)\n", prog);
    exit(1);
 }
 
@@ -1429,7 +1447,47 @@ void cleanup_and_exit(int sig)
 int main(int argc, char *argv[])
 {
    tzset();
-   openlog("DarkChains", LOG_PID | LOG_NDELAY, SYSLOG_FACILITY);
+
+   int i_get = 0, i_ret = 0;
+   const char *pc_ofile = NULL;
+   bool b_fail = 0;
+   int loglevel = LOGLEVEL;
+   int foreground = 0;
+   int log_stderr = 0;
+   mode_t sock_umask = 0177;
+
+   while ((i_get = getopt(argc, argv, "p:u:l:m:fLh")) != -1)
+   {
+      switch (i_get)
+      {
+         case 'p': pc_oconn = optarg; break;
+         case 'u': pc_user = optarg; break;
+         case 'l':
+         {
+            int lv = parse_loglevel(optarg);
+            if (lv < 0)
+            {
+               fprintf(stderr, "Invalid loglevel: %s "
+                       "(use debug|info|notice|warning|err)\n", optarg);
+               return 1;
+            }
+            loglevel = lv;
+            break;
+         }
+         case 'm': sock_umask = (mode_t)strtol(optarg, NULL, 8); break;
+         case 'f': foreground = 1; break;
+         case 'L': log_stderr = 1; break;
+         default: dcs_usage(argv[0]);
+      }
+   }
+
+   /* Open syslog with optional stderr mirroring */
+   {
+      int log_flags = LOG_PID | LOG_NDELAY;
+      if (log_stderr) log_flags |= LOG_PERROR;
+      openlog("DarkChains", log_flags, SYSLOG_FACILITY);
+   }
+   setlogmask(LOG_UPTO(loglevel));
 
    /* Get local FQDN at runtime */
    {
@@ -1453,20 +1511,6 @@ int main(int argc, char *argv[])
       }
       else
          securecpy(my_hostname, "localhost", sizeof(my_hostname));
-   }
-
-   int i_get = 0, i_ret = 0;
-   const char *pc_ofile = NULL;
-   bool b_fail = 0;
-
-   while ((i_get = getopt(argc, argv, "p:u:")) != -1)
-   {
-      switch (i_get)
-      {
-         case 'p': pc_oconn = optarg; break;
-         case 'u': pc_user = optarg; break;
-         default: dcs_usage(argv[0]);
-      }
    }
 
    if (!strncmp(pc_oconn, "unix:", 5))
@@ -1545,7 +1589,7 @@ int main(int argc, char *argv[])
       goto done;
    }
 
-   if (!b_fail && daemon(0, 0))
+   if (!b_fail && !foreground && daemon(0, 0))
    {
       fprintf(stderr, "daemon: %s\n", strerror(errno));
       i_ret = 1;
@@ -1560,7 +1604,7 @@ int main(int argc, char *argv[])
       goto done;
    }
 
-   umask(0177);
+   umask(sock_umask);
    signal(SIGPIPE, SIG_IGN);
    signal(SIGTERM, cleanup_and_exit);
    signal(SIGINT,  cleanup_and_exit);
@@ -1570,7 +1614,7 @@ int main(int argc, char *argv[])
    i_ret = smfi_main();
 
    if (i_ret != MI_SUCCESS)
-      syslog(LOGLEVEL, "[ERROR] DarkChains terminated due to a fatal error");
+      syslog(LOG_ERR, "[ERROR] DarkChains terminated due to a fatal error");
 
 done:
    return i_ret;

@@ -11,8 +11,8 @@
 - ✅ Stateless milter
 - ✅ Streaming (no body buffering)
 - ✅ No MTA core changes required
-- ✅ Tested with Sendmail
-- ⚠️ Looking for Postfix testing / feedback
+- ✅ Tested with Sendmail and Postfix
+- ✅ Docker-friendly (foreground mode, stderr logging)
 
 This is not an official DKIM2 implementation, but a practical, running implementation of a deployable core profile.
 
@@ -36,11 +36,14 @@ echo -n 'v=DKIM1; k=rsa; p=' && openssl rsa -in /etc/DarkChains/yourdomain.tld.p
 # dkim2._domainkey.yourdomain.tld  IN TXT  "v=DKIM1; k=rsa; p=<paste above>"
 
 # Run
-su -c "/usr/local/sbin/DarkChain &" -s /bin/sh - smmsp
-su -c "/usr/local/sbin/DarkChains &" -s /bin/sh - smmsp
+su -c "/usr/local/sbin/DarkChain -u smmsp &" -s /bin/sh - smmsp
+su -c "/usr/local/sbin/DarkChains -u smmsp &" -s /bin/sh - smmsp
+
+# Or for Docker / foreground with stderr logging:
+/usr/local/sbin/DarkChain -u nobody -m 0000 -f -L -l info
 ```
 
-Add the milter sockets to `sendmail.mc` (see [Sendmail configuration](#sendmail-configuration) below), reload, and you are running. The verifier is log-only by default - no message is ever rejected until enforcement mode is explicitly enabled (see [Operating Mode](#operating-mode)).
+Add the milter sockets to `sendmail.mc` (see [Sendmail configuration](#sendmail-configuration) below) or `main.cf` for Postfix (see [Postfix configuration](#postfix-configuration)), reload, and you are running. The verifier is log-only by default - no message is ever rejected until enforcement mode is explicitly enabled (see [Operating Mode](#operating-mode)).
 
 Full configuration, pipeline ordering, key rotation, and enforcement details are in the sections below.
 
@@ -204,6 +207,28 @@ exclusion list to ensure `hh=` values match.
 openssl rand -base64 32 > /etc/DarkChains/srs.key
 chmod 600 /etc/DarkChains/srs.key
 
+### Command-line options
+
+Both milters accept the same options:
+
+```
+-u user    Run as user (default: smmsp)
+-p socket  Milter socket (default: unix:/var/spool/DarkChain/sock)
+-l level   Log level: debug|info|notice|warning|err (default: notice)
+-m umask   Socket umask in octal (default: 0177)
+-f         Run in foreground (no daemon)
+-L         Log to stderr (in addition to syslog)
+-h         Show usage
+```
+
+The `-f` and `-L` flags are designed for Docker and container
+deployments where daemonization is undesirable and syslog may not
+be available.
+
+The `-m` flag controls socket permissions. The default `0177` works
+for Sendmail when the milter runs as the same user. For Postfix or
+cross-user setups, use `-m 0000` or `-m 0007` as needed.
+
 ### Sendmail configuration
 
 Add to `sendmail.mc`, DarkChain **before** DarkChains in the milter chain. Adjust macro definitions as needed for your environment:
@@ -246,6 +271,12 @@ m4 sendmail.mc > sendmail.cf
 systemctl reload sendmail
 ```
 
+### Postfix configuration
+
+See [postfix-SRS.md](postfix-SRS.md) for the complete Postfix setup,
+including the cascaded dual-instance configuration required for SRS
+envelope rewriting.
+
 ### Socket directories
 
 Each milter expects its socket directory to exist before startup:
@@ -262,7 +293,7 @@ chown smmsp:smmsp /var/spool/DarkChain /var/spool/DarkChains
 ```bash
 PIDFILE="/var/run/darkchains.pid"
 pgrep -x DarkChains >/dev/null && { echo "DarkChains already running"; exit 1; }
-su -c "/usr/local/sbin/DarkChains &" -s /bin/sh - smmsp
+su -c "/usr/local/sbin/DarkChains -u smmsp &" -s /bin/sh - smmsp
 sleep 1
 pgrep -x DarkChains > "$PIDFILE"
 ```
@@ -272,9 +303,15 @@ pgrep -x DarkChains > "$PIDFILE"
 ```bash
 PIDFILE="/var/run/darkchain.pid"
 pgrep -x DarkChain >/dev/null && { echo "DarkChain already running"; exit 1; }
-su -c "/usr/local/sbin/DarkChain &" -s /bin/sh - smmsp
+su -c "/usr/local/sbin/DarkChain -u smmsp &" -s /bin/sh - smmsp
 sleep 1
 pgrep -x DarkChain > "$PIDFILE"
+```
+
+### Docker
+
+```dockerfile
+CMD ["/usr/local/sbin/DarkChain", "-u", "nobody", "-m", "0000", "-f", "-L", "-l", "info"]
 ```
 
 ### Key generation
@@ -314,10 +351,13 @@ DarkChain currently operates in **transition mode** (log-only) by default:
 To switch to **enforcement mode**, set `#define ENFORCE 1` in
 `DarkChain.c` and recompile. When enabled:
 
-- `dkim2=fail` or `dkim2=permerror` → `550 5.7.1` REJECT
-- `dkim2=temperror` → `451 4.7.1` TEMPFAIL
-- Per draft §3.5.1, the rejection targets the connected peer — never
-  the original sender — preventing backscatter
+- `dkim2=fail` or `dkim2=permerror` -> `550 5.7.1` REJECT
+- `dkim2=temperror` -> `451 4.7.1` TEMPFAIL
+- Null-sender messages (DSN/bounce with MAIL FROM `<>`) are **never**
+  rejected regardless of verification outcome, per RFC 5321 Section 6.1
+  loop prevention
+- Per draft Section 3.5.1, the rejection targets the connected peer - never
+  the original sender - preventing backscatter
 
 Authentication headers are always injected before the reject decision,
 preserving full observability in logs.
