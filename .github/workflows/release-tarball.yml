@@ -14,6 +14,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build tarball
+        id: build
         run: |
           TAG="${GITHUB_REF_NAME}"
           case "$TAG" in
@@ -26,14 +27,21 @@ jobs:
               PATHS="libdark darkarc LICENSE README.md"
               ;;
             *)
-              echo "Tag $TAG non gestito, nessun tarball"
+              echo "Tag $TAG non gestito, salto il build."
+              echo "SKIP=true" >> $GITHUB_ENV
               exit 0
               ;;
           esac
+
+          # Genero il tarball usando le variabili locali del case
           git archive --format=tar.gz --prefix="${NAME}/" \
               -o "${NAME}.tar.gz" HEAD $PATHS
+          
+          # Dico allo step successivo che abbiamo un file pronto
+          echo "SKIP=false" >> $GITHUB_ENV
 
       - name: Upload asset
+        if: env.SKIP == 'false'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "$GITHUB_REF_NAME" ./*.tar.gz --clobber
