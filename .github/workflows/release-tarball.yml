@@ -1,0 +1,39 @@
+name: Release tarball
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  tarball:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build tarball
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          case "$TAG" in
+            darkchain-v*)
+              NAME="darkchain-${TAG#darkchain-v}"
+              PATHS="libdark dkim2-darkchain LICENSE README.md"
+              ;;
+            darkarc-v*)
+              NAME="darkarc-${TAG#darkarc-v}"
+              PATHS="libdark darkarc LICENSE README.md"
+              ;;
+            *)
+              echo "Tag $TAG non gestito, nessun tarball"
+              exit 0
+              ;;
+          esac
+          git archive --format=tar.gz --prefix="${NAME}/" \
+              -o "${NAME}.tar.gz" HEAD $PATHS
+
+      - name: Upload asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" ./*.tar.gz --clobber
