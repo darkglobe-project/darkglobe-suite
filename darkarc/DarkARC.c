@@ -19,15 +19,26 @@
 #define MAX_HEADER_COUNT  800
 #define MAX_CAPACITY 200
 #define MY_DOMAIN "dns.itb.it"
-#define DEBUG 0
 #define OCONN           "unix:/var/spool/DarkARC/sock"
 #define USER            "smmsp"
 #define SDUSER          "smmsp"
-#define LOGLEVEL        LOG_ERR
+#define LOGLEVEL        LOG_NOTICE
 #define MAX_DKIM_RESULTS 4
 
 /* Syslog facility */
 #define SYSLOG_FACILITY	LOG_DAEMON
+
+/* Parse -l argument to syslog level */
+static int parse_loglevel(const char *s)
+{
+   if (strcasecmp(s, "debug")   == 0) return LOG_DEBUG;
+   if (strcasecmp(s, "info")    == 0) return LOG_INFO;
+   if (strcasecmp(s, "notice")  == 0) return LOG_NOTICE;
+   if (strcasecmp(s, "warning") == 0) return LOG_WARNING;
+   if (strcasecmp(s, "err")     == 0) return LOG_ERR;
+   if (strcasecmp(s, "error")   == 0) return LOG_ERR;
+   return -1;
+}
 
 static sfsistat da_connect(SMFICTX *, char *, _SOCK_ADDR *);
 static sfsistat da_helo(SMFICTX *, char *);
@@ -113,7 +124,7 @@ struct context
 
     const char *pc_oconn = OCONN;
     const char *pc_user = USER;
-    const char my_hostname[]=MY_DOMAIN;
+    char my_hostname[256] = MY_DOMAIN;
 
 
 struct smfiDesc arcmilter = {
@@ -842,7 +853,6 @@ sfsistat da_eom(SMFICTX *ctx)
             snprintf(ams_header_to_hash, sizeof(ams_header_to_hash)-1, "%s: %s\r\n",
             ps_context->headers[j].name, ps_context->headers[j].value);
          }
-         if (DEBUG)
          syslog (LOG_DEBUG, "DA_EOM: LAST Hashed Header [%s]", ams_header_to_hash);
 
 
@@ -914,7 +924,6 @@ sfsistat da_eom(SMFICTX *ctx)
             for (unsigned int i = 0; i < m_hash_len; i++)
             sprintf(hex_hash + i*2, "%02x", m_hash[i]);
 
-            if (DEBUG)
             syslog(LOG_DEBUG, "DA_EOM: calculated hash header: %s", hex_hash);
 
             // Also log the first bytes of the decoded signature
@@ -922,7 +931,6 @@ sfsistat da_eom(SMFICTX *ctx)
             int preview = firma_bin_len < 16 ? firma_bin_len : 16;
             for (int i = 0; i < preview; i++)
             sprintf(hex_sig + i*2, "%02x", firma_binaria[i]);
-            if (DEBUG)
             syslog(LOG_DEBUG, "DA_EOM: binary signature (first 16 bytes): %s", hex_sig);
 
 
@@ -1746,35 +1754,64 @@ sfsistat da_envfrom(SMFICTX *ctx, char **argv)
 int main(int argc, char *argv[])
 {
    tzset();
-   openlog("DarkARC", LOG_PID | LOG_NDELAY, SYSLOG_FACILITY);
    int i_get=0, i_ret=0;
    const char *pc_ofile = NULL;
    bool b_fail=0;
-   if (argc < 2)
-   {
-      fprintf(stderr, "Usage: %s <socket-path>\n", argv[0]);
-      return 1;
-   }
+   int loglevel = LOGLEVEL;
+   int foreground = 0;
+   int log_stderr = 0;
+   mode_t sock_umask = 0177;
 
-   while ((i_get = getopt(argc, argv, "p:u:U:")) != -1)
+   while ((i_get = getopt(argc, argv, "p:u:l:m:S:fLh")) != -1)
    {
       switch (i_get)
       {
          case 'p':
-         pc_oconn = optarg;
-         break;
+            pc_oconn = optarg;
+            break;
          case 'u':
-         pc_user = optarg;
-         break;
+            pc_user = optarg;
+            break;
+         case 'l':
+         {
+            int lv = parse_loglevel(optarg);
+            if (lv < 0)
+            {
+               fprintf(stderr, "Invalid loglevel: %s "
+                       "(use debug|info|notice|warning|err)\n", optarg);
+               return 1;
+            }
+            loglevel = lv;
+            break;
+         }
+         case 'm':
+            sock_umask = (mode_t)strtol(optarg, NULL, 8);
+            break;
+         case 'S':
+            snprintf(my_hostname, sizeof(my_hostname), "%s", optarg);
+            break;
+         case 'f':
+            foreground = 1;
+            break;
+         case 'L':
+            log_stderr = 1;
+            break;
          default:
-         da_usage(argv[0]);
+            da_usage(argv[0]);
       }
    }
 
+   {
+      int log_flags = LOG_PID | LOG_NDELAY;
+      if (log_stderr) log_flags |= LOG_PERROR;
+      openlog("DarkARC", log_flags, SYSLOG_FACILITY);
+   }
+   setlogmask(LOG_UPTO(loglevel));
+
    if (!strncmp(pc_oconn, "unix:", 5))
-   pc_ofile = pc_oconn + 5;
+      pc_ofile = pc_oconn + 5;
    else if (!strncmp(pc_oconn, "local:", 6))
-   pc_ofile = pc_oconn + 6;
+      pc_ofile = pc_oconn + 6;
    if (pc_ofile) unlink(pc_ofile);
    if (!getuid())
    {
@@ -1783,7 +1820,7 @@ int main(int argc, char *argv[])
       if ((pw = getpwnam(pc_user)) == NULL)
       {
          fprintf(stderr, "getpwnam: %s: %s\n", pc_user,
-         strerror(errno));
+            strerror(errno));
          return (1);
       }
       setgroups(1, &pw->pw_gid);
@@ -1792,9 +1829,7 @@ int main(int argc, char *argv[])
          fprintf(stderr, "setgid: %s\n", strerror(errno));
          return (1);
       }
-      if (
-      seteuid(pw->pw_uid) ||
-      setuid(pw->pw_uid))
+      if (seteuid(pw->pw_uid) || setuid(pw->pw_uid))
       {
          fprintf(stderr, "setuid: %s\n", strerror(errno));
          return (1);
@@ -1810,24 +1845,21 @@ int main(int argc, char *argv[])
       fprintf(stderr, "smfi_register: failed\n");
       goto done;
    }
-   if ((!b_fail) && (daemon(0, 0)))
+   if (!b_fail && !foreground && daemon(0, 0))
    {
       fprintf(stderr, "daemon: %s\n", strerror(errno));
       goto done;
    }
-   umask(0177);
+   umask(sock_umask);
    signal(SIGPIPE, SIG_IGN);
    signal(SIGTERM, cleanup_and_exit);
    signal(SIGINT,  cleanup_and_exit);
    i_ret = smfi_main();
 
    if (i_ret != MI_SUCCESS)
-   syslog(LOGLEVEL, "[ERROR] DarkARC terminated due to a fatal error");
+      syslog(LOG_ERR, "[ERROR] DarkARC terminated due to a fatal error");
    done:
    return (i_ret);
-
-   if (smfi_register(arcmilter) == MI_FAILURE) return 1;
-
 }
 
 // Helper function
@@ -2039,16 +2071,16 @@ static sfsistat da_helo(SMFICTX *ctx, char *pc_helohost)
 {
    struct context *ps_context;
 
-   syslog(LOGLEVEL, "DA_HELO: start");
+   syslog(LOG_DEBUG, "DA_HELO: start");
 
    if ((ps_context = (struct context *)smfi_getpriv(ctx)) == NULL)
    {
-      syslog(LOGLEVEL, "DA_HELO: smfi_getpriv error");
+      syslog(LOG_ERR, "DA_HELO: smfi_getpriv error");
       return (SMFIS_ACCEPT);
    }
    securecpy(ps_context->helo, pc_helohost, sizeof(ps_context->helo));
 
-   syslog(LOGLEVEL, "DA_HELO: end %s", ps_context->helo);
+   syslog(LOG_DEBUG, "DA_HELO: end %s", ps_context->helo);
    return (SMFIS_CONTINUE);
 }
 
@@ -2189,7 +2221,6 @@ static sfsistat da_eoh(SMFICTX *ctx)
                ps_context->headers[j].name, ps_context->headers[j].value);
             }
             // Update OpenSSL hash
-            if (DEBUG)
             {
                char bufferino[5000];
                securecpy(bufferino, canon_buf, strlen(canon_buf));
@@ -2207,7 +2238,6 @@ static sfsistat da_eoh(SMFICTX *ctx)
          }
       }
    }
-   if (DEBUG)
    {
       syslog (LOG_DEBUG, "DA_EOH: REFERENCE INDEX [%i]", ps_context->found_arc);
       syslog (LOG_DEBUG, "DA_EOH: cv [%s], algAMS [%s], alg_AS [%s]", ps_context->params.cv,
@@ -2236,7 +2266,14 @@ static sfsistat da_eoh(SMFICTX *ctx)
 
 void da_usage(const char * usage)
 {
-   fprintf(stderr, "usage: %s [-u user] [-p pipe]\n", usage);
+   fprintf(stderr, "usage: %s [-u user] [-p socket] [-S hostname] [-l level] [-m umask] [-f] [-L]\n"
+                   "  -u user      Run as user (default: smmsp)\n"
+                   "  -p socket    Milter socket (default: unix:/var/spool/DarkARC/sock)\n"
+                   "  -S hostname  Server hostname / authserv-id (default: %s)\n"
+                   "  -l level     Log level: debug|info|notice|warning|err (default: notice)\n"
+                   "  -m umask     Socket umask in octal (default: 0177)\n"
+                   "  -f           Run in foreground (no daemon)\n"
+                   "  -L           Log to stderr (in addition to syslog)\n", usage, MY_DOMAIN);
    exit(1);
 }
 

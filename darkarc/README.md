@@ -47,7 +47,8 @@ decision or vice versa.
 
 ## Interoperability
 
-DarkARC is in active use on production mail infrastructure and interoperates
+DarkARC is in active use on production mail infrastructure with both
+Sendmail and Postfix, and interoperates
 without issue with the ARC chains produced by **Google** and **Microsoft** —
 both as a verifier of their inbound seals and as a signer whose seals are
 accepted downstream. These are the two implementations that matter most in
@@ -216,14 +217,66 @@ m4 sendmail.mc > sendmail.cf
 systemctl reload sendmail
 ```
 
+### Command-line options
+
+DarkARC
+
+```
+-u user    Run as user (default: smmsp)
+-p socket  Milter socket (default: unix:/var/spool/DarkARC/sock)
+-l level   Log level: debug|info|notice|warning|err (default: notice)
+-m umask   Socket umask in octal (default: 0177)
+-S hostname  Server hostname (default: dns.itb.it)
+-f         Run in foreground (no daemon)
+-L         Log to stderr (in addition to syslog)
+-h         Show usage
+```
+DarkARCs
+
+```
+-u user    Run as user (default: smmsp)
+-p socket  Milter socket (default: unix:/var/spool/DarkARC/sock)
+-l level   Log level: debug|info|notice|warning|err (default: notice)
+-m umask   Socket umask in octal (default: 0177)
+-S hostname  Server hostname (default: dns.itb.it)
+-d domain    Signing domain for d= tag (default: itb.it)
+-f         Run in foreground (no daemon)
+-L         Log to stderr (in addition to syslog)
+-h         Show usage
+```
+
+
+The `-f` and `-L` flags are designed for Docker and container
+deployments where daemonization is undesirable and syslog may not
+be available.
+
 ### Run scripts
 
 ```bash
 # Verifier
-pgrep -x DarkARC  >/dev/null || su -c "/usr/local/sbin/DarkARC &"  -s /bin/sh - smmsp
+pgrep -x DarkARC  >/dev/null || su -c "/usr/local/sbin/DarkARC -u smmsp &"  -s /bin/sh - smmsp
 
 # Signer
-pgrep -x DarkARCs >/dev/null || su -c "/usr/local/sbin/DarkARCs &" -s /bin/sh - smmsp
+pgrep -x DarkARCs >/dev/null || su -c "/usr/local/sbin/DarkARCs -u smmsp &" -s /bin/sh - smmsp
+
+# Docker
+# DarkARC -u nobody -m 0000 -f -L -l info
+```
+
+### Postfix integration
+
+Add to `main.cf`:
+
+```
+smtpd_milters = unix:/var/spool/DarkARC/sock, unix:/var/spool/DarkARCs/sock
+milter_default_action = accept
+```
+
+Run the milters as the `postfix` user:
+
+```bash
+/usr/local/sbin/DarkARC -u postfix
+/usr/local/sbin/DarkARCs -u postfix
 ```
 
 ## Operating mode

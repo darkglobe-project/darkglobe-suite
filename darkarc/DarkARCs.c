@@ -27,7 +27,6 @@
 /* DarkARCs-specific configuration */
 #define MY_SERVER         "dns.itb.it"
 #define DOMAIN            "itb.it"
-#define DEBUG             0
 #define DEBUG1            0
 #define MAX_DOMAIN_SIZE   256
 #define MAX_HEADER_COUNT  800
@@ -38,11 +37,23 @@
 #define SDUSER            "smmsp"
 #define SELETTORE         "arc1"
 #define HPARAM            "from:message-id:date:subject:to"
-#define LOGLEVEL          LOG_ERR
+#define LOGLEVEL          LOG_NOTICE
 #define NOLOCALSIGN       1
 
 /* Syslog facility */
 #define SYSLOG_FACILITY	LOG_DAEMON
+
+/* Parse -l argument to syslog level */
+static int parse_loglevel(const char *s)
+{
+   if (strcasecmp(s, "debug")   == 0) return LOG_DEBUG;
+   if (strcasecmp(s, "info")    == 0) return LOG_INFO;
+   if (strcasecmp(s, "notice")  == 0) return LOG_NOTICE;
+   if (strcasecmp(s, "warning") == 0) return LOG_WARNING;
+   if (strcasecmp(s, "err")     == 0) return LOG_ERR;
+   if (strcasecmp(s, "error")   == 0) return LOG_ERR;
+   return -1;
+}
 
 static sfsistat das_connect(SMFICTX *, char *, _SOCK_ADDR *);
 static sfsistat das_helo(SMFICTX *, char *);
@@ -98,7 +109,8 @@ struct context
 
 const char *pc_oconn = OCONN;
 const char *pc_user = USER;
-const char my_hostname[]=MY_SERVER;
+char my_hostname[256] = MY_SERVER;
+char signing_domain[256] = DOMAIN;
 static EVP_PKEY* global_pkey;
 
 
@@ -217,12 +229,11 @@ sfsistat das_header(SMFICTX *ctx, char *headerf, char *headerv)
    struct context *ps_context;
    ps_context = (struct context *)smfi_getpriv(ctx);
    int indice_ARC;  
-   if (DEBUG)
-      syslog(LOG_DEBUG, "DAS_HEADER: [%s] -> [%s]", headerf, headerv);
+
+   syslog(LOG_DEBUG, "DAS_HEADER: [%s] -> [%s]", headerf, headerv);
    if (strcasecmp(headerf, "X-DarkARC-Internal-Status") == 0) 
    {
-      if (DEBUG)
-         syslog(LOG_DEBUG, "DAS_HEADER: Found X-ARC-Internal-Status: %s ", headerv);
+      syslog(LOG_DEBUG, "DAS_HEADER: Found X-ARC-Internal-Status: %s ", headerv);
       // DarkARC processed an incoming message
       char ca_head[MAX_HEADER_VALUE];
       strcpy (ca_head, headerv);
@@ -231,10 +242,9 @@ sfsistat das_header(SMFICTX *ctx, char *headerf, char *headerv)
       strncpy (ps_context->cv_status, headerv,4);
       ps_context->cv_status[4]='\0';
       syslog(LOG_DEBUG, "DAS_HEADER: Found Internal Status");
-//      smfi_chgheader(ctx, "X-DarkARC-Internal-Status", 1, NULL);
+
    }
-   if (DEBUG)
-      syslog (LOG_DEBUG, "DAS_HEADER: header count/capacity: %d/%d", ps_context->header_cnt,
+   syslog (LOG_DEBUG, "DAS_HEADER: header count/capacity: %d/%d", ps_context->header_cnt,
              ps_context->header_capacity);
    // If current max capacity is reached, expand
    if (ps_context->header_cnt >= ps_context->header_capacity) 
@@ -375,7 +385,6 @@ sfsistat das_eom(SMFICTX *ctx)
       if (ps_context->new_arc> 0)
         smfi_chgheader(ctx, "X-DarkARC-Internal-Status", 1, NULL);
 
-      if (DEBUG)
       {
          syslog(LOG_DEBUG, "DAS_EOM - pkey ptr: %p", (void *)global_pkey);
          syslog(LOG_DEBUG, "DAS_EOM - ctx ptr: %p", (void *)ps_context->mdctx_header);
@@ -459,8 +468,7 @@ sfsistat das_eom(SMFICTX *ctx)
               "i=1; %s; spf=none; dmarc=none; dkim=none; arc=none", ca_domain);
          smfi_addheader(ctx, "ARC-Authentication-Results", aar_header_top_inj);
       }
-      if (DEBUG)
-         syslog(LOG_DEBUG, "DAS_EOM - 1 - DEBUG AAR: [%s]", aar_header_top);
+      syslog(LOG_DEBUG, "DAS_EOM - 1 - DEBUG AAR: [%s]", aar_header_top);
 
       if (ps_context->new_arc>0)
       {
@@ -474,11 +482,11 @@ sfsistat das_eom(SMFICTX *ctx)
             " h=%s;"
             " b=",
             ps_context->new_arc,
-            DOMAIN, SELETTORE, 
+            signing_domain, SELETTORE, 
             bh_bodyhash, HPARAM);
          snprintf(ams_header_top_inj, sizeof(ams_header_top_inj),
             "i=%d; a=rsa-sha256; c=relaxed/relaxed; d=%s; s=%s; bh=%s; h=%s; b=",
-                 ps_context->new_arc, DOMAIN, SELETTORE, bh_bodyhash, HPARAM);
+                 ps_context->new_arc, signing_domain, SELETTORE, bh_bodyhash, HPARAM);
       }
       else
       {
@@ -488,16 +496,15 @@ sfsistat das_eom(SMFICTX *ctx)
             " bh=%s;"
             " h=%s;"
             " b=", 1,
-            DOMAIN, SELETTORE,
+            signing_domain, SELETTORE,
             bh_bodyhash, HPARAM);
          memset (ams_header_top_inj, '\0', sizeof(ams_header_top_inj));
          snprintf(ams_header_top_inj, sizeof(ams_header_top_inj),
             "i=%d; a=rsa-sha256; c=relaxed/relaxed; d=%s; s=%s; bh=%s; h=%s; b=", 1,
-            DOMAIN, SELETTORE, 
+            signing_domain, SELETTORE, 
             bh_bodyhash, HPARAM);
       }
-      if (DEBUG)
-         syslog(LOG_DEBUG, "DAS_EOM: 2 - DEBUG AMS: [%s]", ams_header_top);
+      syslog(LOG_DEBUG, "DAS_EOM: 2 - DEBUG AMS: [%s]", ams_header_top);
 
       // 2. Pass this string to signature context
       // Note: header must be passed canonicalized (relaxed: lowercase name, trim spaces)
@@ -547,8 +554,7 @@ sfsistat das_eom(SMFICTX *ctx)
       securecat(ams_header_top_inj, b64_signature, sizeof(ams_header_top_inj));
       securecat(ams_header_top, b64_signature, sizeof(ams_header_top));
 
-      if (DEBUG)
-         syslog(LOG_DEBUG, "DAS_EOM: DEBUG AMS WITH b=: [%s]", ams_header_top);
+      syslog(LOG_DEBUG, "DAS_EOM: DEBUG AMS WITH b=: [%s]", ams_header_top);
        
       smfi_addheader(ctx, "ARC-Message-Signature", ams_header_top_inj);
       free(sig_value);
@@ -609,8 +615,7 @@ sfsistat das_eom(SMFICTX *ctx)
       char as_header_top_inj[ARCS_HEADER_BUF]; 
       memset (as_header_top, '\0', sizeof(as_header_top));
       memset (as_header_top_inj, '\0', sizeof(as_header_top_inj));
-      if (DEBUG)
-         syslog(LOG_DEBUG, "DAS_EOM: DEBUG AAR for AS [%s]", aar_header_top);
+      syslog(LOG_DEBUG, "DAS_EOM: DEBUG AAR for AS [%s]", aar_header_top);
 
       if (EVP_DigestSignUpdate(as_sctx, aar_header_top, strlen(aar_header_top)) != 1)
       {
@@ -618,15 +623,13 @@ sfsistat das_eom(SMFICTX *ctx)
          return SMFIS_TEMPFAIL;
       }
 
-      if (DEBUG)
-         syslog(LOG_DEBUG, "DAS_EOM: DEBUG AMS for AS [%s]", ams_header_top);
+      syslog(LOG_DEBUG, "DAS_EOM: DEBUG AMS for AS [%s]", ams_header_top);
       if (EVP_DigestSignUpdate(as_sctx, ams_header_top, strlen(ams_header_top)) != 1)
       {
          syslog(LOG_ERR, "DAS_EOM: EVP_DigestSignInit AMS->AS failure");
          return SMFIS_TEMPFAIL;
       }
-      if (DEBUG)
-         syslog(LOG_DEBUG, "DAS_EOM: DEBUG AMS for AS [%s]",  "\r\n");
+      syslog(LOG_DEBUG, "DAS_EOM: DEBUG AMS for AS [%s]",  "\r\n");
       if ((EVP_DigestSignUpdate(as_sctx, "\r\n", 2)) != 1)
       {
          syslog(LOG_ERR, "DAS_EOM: EVP_DigestSignInit AMS->AAS failure");
@@ -638,11 +641,11 @@ sfsistat das_eom(SMFICTX *ctx)
          memset (as_header_top, '\0', sizeof(as_header_top));
          snprintf(as_header_top, sizeof(as_header_top),
               "arc-seal:i=%d; a=rsa-sha256; s=%s; d=%s; cv=%s; b=", 1,
-                 SELETTORE, DOMAIN, "none");
+                 SELETTORE, signing_domain, "none");
          memset (as_header_top_inj, '\0', sizeof(as_header_top_inj));
          snprintf(as_header_top_inj, sizeof(as_header_top),
               "i=%d; a=rsa-sha256; s=%s; d=%s; cv=%s; b=", 1,
-                 SELETTORE, DOMAIN, "none");
+                 SELETTORE, signing_domain, "none");
       }
       else
       {
@@ -650,15 +653,14 @@ sfsistat das_eom(SMFICTX *ctx)
          snprintf(as_header_top, sizeof(as_header_top),
               "arc-seal:i=%d; a=rsa-sha256; s=%s; d=%s; cv=%s; b=", 
                  ps_context->new_arc,
-                 SELETTORE, DOMAIN, ps_context->cv_status);
+                 SELETTORE, signing_domain, ps_context->cv_status);
          memset (as_header_top_inj, '\0', sizeof(as_header_top_inj));
          snprintf(as_header_top_inj, sizeof(as_header_top),
               "i=%d; a=rsa-sha256; s=%s; d=%s; cv=%s; b=", ps_context->new_arc,
-                 SELETTORE, DOMAIN, ps_context->cv_status);
+                 SELETTORE, signing_domain, ps_context->cv_status);
       }
 
-      if (DEBUG)
-         syslog(LOG_DEBUG, "DAS_EOM: DEBUG AS per AS [%s]", as_header_top);
+      syslog(LOG_DEBUG, "DAS_EOM: DEBUG AS per AS [%s]", as_header_top);
 
       if (EVP_DigestSignUpdate(as_sctx, as_header_top, strlen(as_header_top)) != 1)
       {
@@ -698,7 +700,7 @@ sfsistat das_eom(SMFICTX *ctx)
       free (b64_signature2);
       smfi_addheader(ctx, "ARC-Seal", as_header_top_inj);
       if (!ps_context->has_darc_xsigned)
-         smfi_addheader(ctx, "X-Signed", "DarkARC v1.1");
+         smfi_addheader(ctx, "X-Signed", "DarkARC v1.2");
    }
    return SMFIS_CONTINUE;
 }
@@ -787,8 +789,8 @@ sfsistat das_envfrom(SMFICTX *ctx, char **argv)
 {
    // 1. Retrieve private structure
    struct context *priv = (struct context *)smfi_getpriv(ctx);
-   if (DEBUG)
-      syslog(LOGLEVEL, "DAS_ENVFROM: start");
+
+   syslog(LOG_DEBUG, "DAS_ENVFROM: start");
 
    priv->msg_count++;
    memset (priv->spf_id, '\0', sizeof (priv->spf_id));
@@ -807,12 +809,12 @@ sfsistat das_envfrom(SMFICTX *ctx, char **argv)
          strncpy(priv->spf_id, argv[0], sizeof(priv->spf_id) - 1);
       }
    }
-   if (DEBUG)
-      syslog(LOGLEVEL, "DAS_ENVFROM: spf_id: [%s]", priv->spf_id);
+
+   syslog(LOG_DEBUG, "DAS_ENVFROM: spf_id: [%s]", priv->spf_id);
    ERR_clear_error(); 
    if (priv->msg_count == 1)
    {
-      syslog(LOGLEVEL, "DAS_ENVFROM: msg_count %d", (priv->msg_count));
+      syslog(LOG_DEBUG, "DAS_ENVFROM: msg_count %d", (priv->msg_count));
       priv->header_capacity = MAX_CAPACITY;
       EVP_MD_CTX_reset(priv->mdctx_header);        
       EVP_MD_CTX_reset(priv->mdctx_body_relaxed);  
@@ -826,10 +828,10 @@ sfsistat das_envfrom(SMFICTX *ctx, char **argv)
    }
    else
    {
-      syslog(LOGLEVEL, "DAS_ENVFROM: other messages in the same connection");
-      syslog(LOGLEVEL, "DAS_ENVFROM: msg_count %d", (priv->msg_count));
+      syslog(LOG_DEBUG, "DAS_ENVFROM: other messages in the same connection");
+      syslog(LOG_DEBUG, "DAS_ENVFROM: msg_count %d", (priv->msg_count));
       // 3. Connection reused (RSET). Reset data without deallocating everything.
-      syslog(LOGLEVEL, "DAS_ENVFROM: initializations");
+      syslog(LOG_DEBUG, "DAS_ENVFROM: initializations");
       priv->cv_status[0]='\0';
       priv->first_rcpt[0]='\0';
       priv->header_cnt = 0;
@@ -842,12 +844,11 @@ sfsistat das_envfrom(SMFICTX *ctx, char **argv)
       priv->body_has_content_relaxed=0;
       priv->is_start_of_line=1;
       priv->p_had_space=0;
-      syslog(LOGLEVEL, "DAS_ENVFROM: initializations finished");
+      syslog(LOG_DEBUG, "DAS_ENVFROM: initializations finished");
       EVP_MD_CTX_reset(priv->mdctx_body_relaxed);
       EVP_MD_CTX_reset(priv->mdctx_header);
 
-      if (DEBUG)
-         syslog(LOGLEVEL, "DAS_ENVFROM: cycle i<%d",  priv->header_capacity);
+      syslog(LOG_DEBUG, "DAS_ENVFROM: cycle i<%d",  priv->header_capacity);
 
       if (priv->headers != NULL) {
          memset(priv->headers, 0, priv->header_capacity * sizeof(struct header_slot));
@@ -858,7 +859,7 @@ sfsistat das_envfrom(SMFICTX *ctx, char **argv)
    {
       return SMFIS_TEMPFAIL;
    }
-   if (DEBUG)
+
    {
       syslog(LOG_DEBUG, "DAS_ENVFROM: pkey ptr: %p", (void *)global_pkey); 
       syslog(LOG_DEBUG, "DAS_ENVFROM: ctx ptr: %p", (void *)priv->mdctx_header);
@@ -872,7 +873,7 @@ sfsistat das_envfrom(SMFICTX *ctx, char **argv)
 
       return SMFIS_TEMPFAIL;
    }
-   if (DEBUG)
+
    {
       syslog(LOG_DEBUG, "DAS_ENVFROM: pkey ptr: %p", (void *)global_pkey); 
       syslog(LOG_DEBUG, "DAS_ENVFROM: ctx ptr: %p", (void *)priv->mdctx_header);
@@ -884,17 +885,15 @@ sfsistat das_envfrom(SMFICTX *ctx, char **argv)
 int main(int argc, char *argv[]) 
 {
    tzset();
-   openlog("DarkARCs", LOG_PID | LOG_NDELAY, SYSLOG_FACILITY);
    int i_get=0, i_ret=0;
    const char *pc_ofile = NULL;
    bool b_fail=0;
-   if (argc < 2) 
-   {
-      fprintf(stderr, "Usage: %s <socket-path>\n", argv[0]);
-      return 1;
-   }
+   int loglevel = LOGLEVEL;
+   int foreground = 0;
+   int log_stderr = 0;
+   mode_t sock_umask = 0177;
 
-   while ((i_get = getopt(argc, argv, "p:u:U:")) != -1) 
+   while ((i_get = getopt(argc, argv, "p:u:l:m:S:d:fLh")) != -1) 
    {
       switch (i_get) 
       {
@@ -904,10 +903,44 @@ int main(int argc, char *argv[])
          case 'u':
             pc_user = optarg;
             break;
+         case 'l':
+         {
+            int lv = parse_loglevel(optarg);
+            if (lv < 0)
+            {
+               fprintf(stderr, "Invalid loglevel: %s "
+                       "(use debug|info|notice|warning|err)\n", optarg);
+               return 1;
+            }
+            loglevel = lv;
+            break;
+         }
+         case 'm':
+            sock_umask = (mode_t)strtol(optarg, NULL, 8);
+            break;
+         case 'S':
+            snprintf(my_hostname, sizeof(my_hostname), "%s", optarg);
+            break;
+         case 'd':
+            snprintf(signing_domain, sizeof(signing_domain), "%s", optarg);
+            break;
+         case 'f':
+            foreground = 1;
+            break;
+         case 'L':
+            log_stderr = 1;
+            break;
          default:
             das_usage(argv[0]);
       }
    }
+
+   {
+      int log_flags = LOG_PID | LOG_NDELAY;
+      if (log_stderr) log_flags |= LOG_PERROR;
+      openlog("DarkARCs", log_flags, SYSLOG_FACILITY);
+   }
+   setlogmask(LOG_UPTO(loglevel));
 
    if (!strncmp(pc_oconn, "unix:", 5))
       pc_ofile = pc_oconn + 5;
@@ -922,7 +955,6 @@ int main(int argc, char *argv[])
    }
    else
       return (1);
-
 
    if (pc_ofile) unlink(pc_ofile);
    if (!getuid()) 
@@ -957,12 +989,12 @@ int main(int argc, char *argv[])
       fprintf(stderr, "smfi_register: failed\n");
       goto done;
    }
-   if ((!b_fail) && (daemon(0, 0))) 
+   if (!b_fail && !foreground && daemon(0, 0)) 
    {
       fprintf(stderr, "daemon: %s\n", strerror(errno));
       goto done;
    }
-   umask(0177);
+   umask(sock_umask);
    signal(SIGPIPE, SIG_IGN);
    signal(SIGTERM, cleanup_and_exit);
    signal(SIGINT,  cleanup_and_exit);
@@ -970,7 +1002,7 @@ int main(int argc, char *argv[])
    i_ret = smfi_main();
 
    if (i_ret != MI_SUCCESS)
-      syslog(LOGLEVEL, "[ERROR] DarkARCs terminated due to a fatal error");
+      syslog(LOG_ERR, "[ERROR] DarkARCs terminated due to a fatal error");
 done:
    return (i_ret);
 }
@@ -1079,16 +1111,16 @@ sfsistat das_connect(SMFICTX *ctx, char *hostname, _SOCK_ADDR *hostaddr)
 static sfsistat das_helo(SMFICTX *ctx, char *pc_helohost)
 {
    struct context *ps_context;
-   syslog(LOGLEVEL, "DAS_HELO: start");
+   syslog(LOG_DEBUG, "DAS_HELO: start");
 
    if ((ps_context = (struct context *)smfi_getpriv(ctx)) == NULL)
    {
-      syslog(LOGLEVEL, "DAS_HELO: smfi_getpriv error");
+      syslog(LOG_ERR, "DAS_HELO: smfi_getpriv error");
       return (SMFIS_ACCEPT);
    }
    securecpy(ps_context->helo, pc_helohost, sizeof(ps_context->helo));
 
-   syslog(LOGLEVEL, "DAS_HELO: end %s", ps_context->helo);
+   syslog(LOG_DEBUG, "DAS_HELO: end %s", ps_context->helo);
    // ps_context->pkey=global_pkey;
 
    // ps_context->pkey=load_private_key(SSLPATH);
@@ -1223,8 +1255,7 @@ static sfsistat das_eoh(SMFICTX *ctx)
             canonicalize_header_relaxed(ps_context->headers[j].name, 
                                       ps_context->headers[j].value, 
                                       canon_buf, sizeof(canon_buf),1);
-            if (DEBUG)
-               syslog(LOG_ERR, "DAS_EOH: [%s]", canon_buf);
+            syslog(LOG_ERR, "DAS_EOH: [%s]", canon_buf);
             if (EVP_DigestSignUpdate(ps_context->mdctx_header, canon_buf, strlen(canon_buf)) != 1)
             {
                syslog(LOG_ERR, "DAS_EOH: EVP_DigestSignUpdate failed");
@@ -1240,7 +1271,15 @@ static sfsistat das_eoh(SMFICTX *ctx)
 
 void das_usage(const char * usage)
 {
-   fprintf(stderr, "usage: %s [-u user] [-p pipe]\n", usage);
+   fprintf(stderr, "usage: %s [-u user] [-p socket] [-S hostname] [-d domain] [-l level] [-m umask] [-f] [-L]\n"
+                   "  -u user      Run as user (default: smmsp)\n"
+                   "  -p socket    Milter socket (default: unix:/var/spool/DarkARCs/sock)\n"
+                   "  -S hostname  Server hostname (default: %s)\n"
+                   "  -d domain    Signing domain for d= tag (default: %s)\n"
+                   "  -l level     Log level: debug|info|notice|warning|err (default: notice)\n"
+                   "  -m umask     Socket umask in octal (default: 0177)\n"
+                   "  -f           Run in foreground (no daemon)\n"
+                   "  -L           Log to stderr (in addition to syslog)\n", usage, MY_SERVER, DOMAIN);
    exit(1);
 }
 
