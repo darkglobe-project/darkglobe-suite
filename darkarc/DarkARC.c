@@ -95,6 +95,9 @@ struct context
     int header_cnt;              // How many slots are currently used
     int header_capacity;         // Capacity of the current allocation
     int found_arc;
+    int arc_struct_fail;           // 1 if the ARC set is structurally invalid
+    char arc_struct_reason[128];   // why (duplicate / missing / bad index)
+    int seen_aar, seen_ams, seen_as; // per-instance parse guard (current level)
     int i_hdr_relaxed;
     int i_body_relaxed;
     int h_num_fields;            // number of fields to hash or buffer for signature verification
@@ -446,6 +449,11 @@ sfsistat da_header(SMFICTX *ctx, char *headerf, char *headerv)
 
    if (strncasecmp(headerf, "ARC-", 4) == 0)
    {
+      /* Which of the three ARC fields is this? */
+      int t_aar = (strcasecmp(headerf, "ARC-Authentication-Results") == 0);
+      int t_ams = (strcasecmp(headerf, "ARC-Message-Signature") == 0);
+      int t_as  = (strcasecmp(headerf, "ARC-Seal") == 0);
+
       indice_ARC=get_arc_index(headerv);
       if (indice_ARC>ps_context->found_arc)
       {
@@ -465,11 +473,38 @@ sfsistat da_header(SMFICTX *ctx, char *headerf, char *headerv)
 
          // reset_arc (&ps_context->params);
          ps_context->found_arc=indice_ARC;
+         /* new instance: no field of this level parsed yet */
+         ps_context->seen_aar = ps_context->seen_ams = ps_context->seen_as = 0;
          parse_arc_header (headerf, headerv, &(ps_context->params));
+         if (t_aar) ps_context->seen_aar = 1;
+         else if (t_ams) ps_context->seen_ams = 1;
+         else if (t_as)  ps_context->seen_as  = 1;
       }
       else if (indice_ARC==ps_context->found_arc)
       {
-         parse_arc_header (headerf, headerv, &(ps_context->params));
+         /* Three different fields legitimately share the same i= and each
+          * fills distinct params. A SECOND field of the SAME type at the same
+          * instance would instead overwrite the first one's values, while the
+          * chain walk in verify_arc_chain() uses the FIRST occurrence — the
+          * two would disagree on d=/s=/b=. Such a set is already rejected by
+          * da_check_arc_structure(); ignoring the duplicate here keeps params
+          * consistent regardless. */
+         int dup = (t_aar && ps_context->seen_aar)
+                || (t_ams && ps_context->seen_ams)
+                || (t_as  && ps_context->seen_as);
+         if (dup)
+         {
+            syslog(LOG_NOTICE,
+                   "DA_HEADER: duplicate %s at i=%d — not parsed",
+                   headerf, indice_ARC);
+         }
+         else
+         {
+            parse_arc_header (headerf, headerv, &(ps_context->params));
+            if (t_aar) ps_context->seen_aar = 1;
+            else if (t_ams) ps_context->seen_ams = 1;
+            else if (t_as)  ps_context->seen_as  = 1;
+         }
       }
       slot->arc_index=indice_ARC;
 
@@ -1345,6 +1380,14 @@ sfsistat da_eom(SMFICTX *ctx)
          arc_verdict = "none";
          snprintf(arc_details, sizeof(arc_details), "no signatures found");
       }
+      else if (ps_context->arc_struct_fail)
+      {
+         /* Invalid ARC set (duplicate or missing instance): the chain cannot
+          * be trusted whatever the signatures say. Verdict only, no reject. */
+         arc_verdict = "fail";
+         snprintf(arc_details, sizeof(arc_details), "%s",
+                  ps_context->arc_struct_reason);
+      }
       else
       {
          int res = verify_arc_chain(ps_context);
@@ -1380,7 +1423,7 @@ sfsistat da_eom(SMFICTX *ctx)
       snprintf(aar_string, sizeof(aar_string),
       "i=%d; %s;\n"
       " arc=%s (%s);\n"
-      " spf=%s smtp.mailfrom=%s;%s" // <-- %s inietterà "\r\n    dkim=pass..."
+      " spf=%s smtp.mailfrom=%s;%s" // %s injects "\n dkim=... header.d=...;" (may repeat)
       "\n dmarc=%s header.from=%s",
       ps_context->found_arc + 1,
       (my_hostname[0] != '\0' ? my_hostname : "localhost"),
@@ -1539,7 +1582,15 @@ void get_results_from_auth_headers(struct context *ps_context)
          {
             clean_value(res); // Remove any leftover \r\n
             clean_value(id);
-            snprintf(tmp_line, sizeof(tmp_line), "\r\n dkim=%s header.d=%s;", res, id);
+            /* Fold with a bare LF, like the other continuation lines of this
+             * header (see the AAR format string above). The MTA is the one
+             * that turns internal line endings into CRLF on the wire: passing
+             * an explicit "\r\n" here relies on the MTA not doubling the CR.
+             * Sendmail normalises it correctly (verified on delivered mail),
+             * but another MTA could emit "\r\r\n" — and a CR that is not part
+             * of a CRLF is not FWS, so it would survive relaxed unfolding and
+             * change the hash seen by a downstream verifier. */
+            snprintf(tmp_line, sizeof(tmp_line), "\n dkim=%s header.d=%s;", res, id);
             char search_pattern[300];
             snprintf(search_pattern, sizeof(search_pattern), "header.d=%s;", id);
             if (strstr(ps_context->dkim_results_buf, search_pattern) == NULL) 
@@ -1696,6 +1747,9 @@ sfsistat da_envfrom(SMFICTX *ctx, char **argv)
       memset(priv->spf_res, 0, sizeof(priv->spf_res));
       memset(priv->dmarc_res, 0, sizeof(priv->dmarc_res));        // return SMFIS_CONTINUE;
       priv->found_arc = 0;
+      priv->arc_struct_fail = 0;
+      priv->arc_struct_reason[0] = '\0';
+      priv->seen_aar = priv->seen_ams = priv->seen_as = 0;
 
 
       return SMFIS_CONTINUE;
@@ -1724,6 +1778,9 @@ sfsistat da_envfrom(SMFICTX *ctx, char **argv)
 
       priv->header_cnt = 0;
       priv->found_arc = 0;
+      priv->arc_struct_fail = 0;
+      priv->arc_struct_reason[0] = '\0';
+      priv->seen_aar = priv->seen_ams = priv->seen_as = 0;
       priv->pending_newlines_simple=0;
       priv->body_has_content_simple=0;
       priv->body_size = 0;
@@ -2091,6 +2148,91 @@ static sfsistat da_envrcpt(SMFICTX *ctx, char **args)
    return (SMFIS_CONTINUE);
 }
 
+/* ---- ARC SET STRUCTURAL INTEGRITY ----
+ *
+ * RFC 8617 mandates exactly one ARC-Authentication-Results, one
+ * ARC-Message-Signature and one ARC-Seal per instance number, with instance
+ * numbers forming a contiguous sequence starting at 1.
+ *
+ * Without this check the chain walk in verify_arc_chain() takes the FIRST
+ * header matching a given index and breaks, silently ignoring any duplicate;
+ * meanwhile da_header() lets a second header at the same index overwrite the
+ * parsed params. An injected duplicate ARC-Seal could therefore be verified
+ * against one instance while a different one is canonicalized. A missing
+ * instance (gap) is equally silent: nothing is appended for that level and
+ * the chain is rebuilt short.
+ *
+ * Verdict only — ARC never rejects; a structurally invalid set yields
+ * arc=fail with an explicit reason.
+ *
+ * Returns 1 if the set is valid, 0 otherwise (reason filled in).
+ */
+static int da_check_arc_structure(struct context *ps)
+{
+   if (ps->found_arc <= 0)
+      return 1;   /* no ARC set: nothing to validate */
+
+   /* Reject malformed/absent i= on any ARC-* field first */
+   for (int j = 0; j < ps->header_cnt; j++)
+   {
+      if (strncasecmp(ps->headers[j].name, "ARC-", 4) != 0)
+         continue;
+      if (ps->headers[j].arc_index <= 0)
+      {
+         snprintf(ps->arc_struct_reason, sizeof(ps->arc_struct_reason),
+                  "structural: bad or missing i= on %s", ps->headers[j].name);
+         return 0;
+      }
+      if (ps->headers[j].arc_index > ps->found_arc)
+      {
+         snprintf(ps->arc_struct_reason, sizeof(ps->arc_struct_reason),
+                  "structural: %s index %d above chain height %d",
+                  ps->headers[j].name, ps->headers[j].arc_index, ps->found_arc);
+         return 0;
+      }
+   }
+
+   /* Exactly one AAR, one AMS and one AS per instance 1..N */
+   for (int lvl = 1; lvl <= ps->found_arc; lvl++)
+   {
+      int n_aar = 0, n_ams = 0, n_as = 0;
+
+      for (int j = 0; j < ps->header_cnt; j++)
+      {
+         if (ps->headers[j].arc_index != lvl)
+            continue;
+         if (strcasecmp(ps->headers[j].name, "ARC-Authentication-Results") == 0)
+            n_aar++;
+         else if (strcasecmp(ps->headers[j].name, "ARC-Message-Signature") == 0)
+            n_ams++;
+         else if (strcasecmp(ps->headers[j].name, "ARC-Seal") == 0)
+            n_as++;
+      }
+
+      const char *dup = (n_aar > 1) ? "ARC-Authentication-Results"
+                      : (n_ams > 1) ? "ARC-Message-Signature"
+                      : (n_as  > 1) ? "ARC-Seal" : NULL;
+      if (dup)
+      {
+         snprintf(ps->arc_struct_reason, sizeof(ps->arc_struct_reason),
+                  "structural: duplicate %s at i=%d", dup, lvl);
+         return 0;
+      }
+
+      const char *miss = (n_aar == 0) ? "ARC-Authentication-Results"
+                       : (n_ams == 0) ? "ARC-Message-Signature"
+                       : (n_as  == 0) ? "ARC-Seal" : NULL;
+      if (miss)
+      {
+         snprintf(ps->arc_struct_reason, sizeof(ps->arc_struct_reason),
+                  "structural: missing %s at i=%d", miss, lvl);
+         return 0;
+      }
+   }
+
+   return 1;
+}
+
 static sfsistat da_eoh(SMFICTX *ctx)
 {
    char h_work_copy[BIG_HEADER_VALUE+1];
@@ -2112,6 +2254,14 @@ static sfsistat da_eoh(SMFICTX *ctx)
       return SMFIS_ACCEPT;
    }
 
+   /* Structural validation of the ARC set before spending any crypto:
+    * duplicates or gaps invalidate the chain regardless of signatures. */
+   if (!da_check_arc_structure(ps_context))
+   {
+      ps_context->arc_struct_fail = 1;
+      syslog(LOG_NOTICE, "DA_EOH: ARC set invalid — %s",
+             ps_context->arc_struct_reason);
+   }
 
    // Header analysis
    ps_context->i_hdr_relaxed = 0;
