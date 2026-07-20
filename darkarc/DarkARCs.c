@@ -369,6 +369,70 @@ sfsistat das_body(SMFICTX *ctx, unsigned char *bodyp, size_t bodylen)
 // From String b= to Binary
 // Signature in AMS header is Base64. We must bring it to a byte array.
 // At message end
+/* ---- HEADER FOLDING (emission only) ----
+ *
+ * Folds a header value at "; " separators, never inside base64.
+ *
+ * Under relaxed canonicalisation a fold (CRLF + WSP) unfolds to a single
+ * space, so turning "; " into ";\n " produces a canonical form byte-identical
+ * to the unfolded one. Nothing already hashed is affected: the ARC-Seal covers
+ * the ARC-Message-Signature with its b= intact, and folding only at separators
+ * leaves that value untouched.
+ *
+ * Folding inside b= or bh= would NOT be safe here: those runs contain no
+ * whitespace, so the unfolded form would gain a space that was absent when the
+ * signature was computed, and a downstream verifier would hash different bytes.
+ * That is precisely the trap this function avoids — at the cost of one long
+ * final line carrying b= (~350 chars with RSA-2048, ~690 with RSA-4096, both
+ * well inside the 998-char limit of RFC 5322 section 2.1.1).
+ *
+ * first_line_offset accounts for the "Name: " prefix that the MTA prepends.
+ */
+#define FOLD_WIDTH 78
+
+static void fold_header_value(char *dst, size_t dstsize, const char *src,
+                              size_t first_line_offset)
+{
+   size_t out = 0, line = first_line_offset;
+
+   if (dstsize == 0) return;
+   dst[0] = '\0';
+
+   while (*src != '\0' && out + 1 < dstsize)
+   {
+      /* Length of the next token, up to (not including) the next "; " */
+      const char *sep = strstr(src, "; ");
+      size_t tok = sep ? (size_t)(sep - src) + 1   /* keep the ';' */
+                       : strlen(src);
+
+      /* Break before this token if the line would overflow — but never on the
+       * very first token, which would produce an empty leading line. */
+      if (out > 0 && line + tok > FOLD_WIDTH)
+      {
+         if (out + 2 >= dstsize) break;
+         dst[out++] = '\n';
+         dst[out++] = ' ';
+         line = 1;                      /* the folding space */
+      }
+      else if (out > 0)
+      {
+         if (out + 1 >= dstsize) break;
+         dst[out++] = ' ';
+         line += 1;
+      }
+
+      if (out + tok >= dstsize) tok = dstsize - out - 1;
+      memcpy(dst + out, src, tok);
+      out  += tok;
+      line += tok;
+
+      src += tok;
+      while (*src == ' ') src++;        /* skip the separator's space(s) */
+   }
+
+   dst[out] = '\0';
+}
+
 sfsistat das_eom(SMFICTX *ctx) 
 {
    struct context *ps_context;
@@ -555,8 +619,13 @@ sfsistat das_eom(SMFICTX *ctx)
       securecat(ams_header_top, b64_signature, sizeof(ams_header_top));
 
       syslog(LOG_DEBUG, "DAS_EOM: DEBUG AMS WITH b=: [%s]", ams_header_top);
-       
-      smfi_addheader(ctx, "ARC-Message-Signature", ams_header_top_inj);
+
+      /* Fold at separators only — canonicalisation-invariant, see
+       * fold_header_value(). The hashed form (ams_header_top) is untouched. */
+      char ams_folded[ARCS_HEADER_BUF];
+      fold_header_value(ams_folded, sizeof(ams_folded), ams_header_top_inj,
+                        sizeof("ARC-Message-Signature: ") - 1);
+      smfi_addheader(ctx, "ARC-Message-Signature", ams_folded);
       free(sig_value);
       free (b64_signature);
 
@@ -698,7 +767,10 @@ sfsistat das_eom(SMFICTX *ctx)
 
       free(sig);
       free (b64_signature2);
-      smfi_addheader(ctx, "ARC-Seal", as_header_top_inj);
+      char as_folded[ARCS_HEADER_BUF];
+      fold_header_value(as_folded, sizeof(as_folded), as_header_top_inj,
+                        sizeof("ARC-Seal: ") - 1);
+      smfi_addheader(ctx, "ARC-Seal", as_folded);
       if (!ps_context->has_darc_xsigned)
          smfi_addheader(ctx, "X-Signed", "DarkARC v1.2");
    }
