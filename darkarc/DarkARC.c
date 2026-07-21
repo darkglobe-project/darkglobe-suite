@@ -1116,12 +1116,18 @@ sfsistat da_eom(SMFICTX *ctx)
                      }
                      else
                      {
+                        /* simple header canon: name and value verbatim, ':' + SP,
+                         * NO trailing CRLF (the AMS signs itself, last header).
+                         * The b= MUST be emptied here too — the signature cannot
+                         * cover its own b= value — otherwise a legitimate
+                         * c=simple AMS would always fail. (The relaxed branch
+                         * above already strips b= inside
+                         * canonicalize_arc_ms_for_verify, so it is left as-is.) */
                         snprintf(ams_canon, sizeof(ams_canon), "%s: %s",
-                        ps_context->headers[j].name, ps_context->headers[j].value);    // da VERIFICARE !!!!!!!!!
+                        ps_context->headers[j].name, ps_context->headers[j].value);
+                        prepare_header_for_hash(ams_canon);   // strip b= value
                      }
 
-                     // Essential: strip the b= tag before verifying
-                     // prepare_header_for_hash(ams_canon);
                      size_t len = strlen(ams_canon);
                      memcpy(p_ptr, ams_canon, len);
                      p_ptr += len;
