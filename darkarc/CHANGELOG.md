@@ -1,6 +1,6 @@
 # Changelog DarkChain / DarkChains (DKIM2)
 
-## [1.2 - 19/07/2026]
+## [1.2 - 21/07/2026]
 
 Runtime configuration and deployment improvements, aligned with the
 DarkChain 0.7 release.
@@ -28,6 +28,8 @@ DarkChain 0.7 release.
   to LOG_DEBUG. Errors (smfi_getpriv failure, fatal termination)
   reclassified to LOG_ERR. The `-l` flag controls filtering via
   `setlogmask(LOG_UPTO())`.
+- **b= strip** in simple mode
+- **Folding** \r\n to \n in AAR dkim=
 
 ### Fixed
 
