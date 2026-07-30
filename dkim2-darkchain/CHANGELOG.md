@@ -1,5 +1,64 @@
 # Changelog DarkChain / DarkChains (DKIM2)
 
+## [1.0 - 26/07/2026]
+
+First stable release, aligned with draft-moccia-dkim2-deployment-profile-07.
+NOTE: This version is not interoperable with the previous ones.
+
+### Protocol alignment (draft-07)
+
+- **DKIM2-Authentication-Results in signed set.** The signature now covers
+  all DKIM2-Authentication-Results headers with i ≤ N, per the updated
+  signed header set definition. New header type DC_HDR_AR added to
+  dc_shared.h.
+
+- **Canonicalization order revised.** The signed set order now matches
+  draft-07 Section 3.3.2:
+  (a) DKIM2-Authentication-Results i ≤ N,
+  (b) DKIM2-Sig-mf i = N,
+  (c) DKIM2-Sig-rt i = N,
+  (d) DKIM2-Mod i ≤ N,
+  (e) message headers from h=,
+  (f) previous DKIM2-Signature i < N,
+  (g) current DKIM2-Signature with b= empty.
+  Both signer and verifier use the same order.
+
+- **Graduated enforcement model (§3.5.2).** Three-case matrix:
+  structural failure (permerror) or proven dishonesty (rollback mismatch
+  with hh= verified) → REJECT in enforcement mode;
+  undetermined-cause failure (signature/header/body/envelope mismatch
+  where b= is valid) → CONTINUE always, even with ENFORCE=1, with
+  result recorded in DKIM2-Authentication-Results.
+  New `reject_on_enforce` flag distinguishes rejectable from
+  non-rejectable failures.
+
+- **Rollback gated on hh= verification.** The rollback check now
+  requires `hh_verified = 1` (hh= present and matching the received
+  header set) before proceeding. Without a verified header hash, the
+  received headers are not trustworthy input for rollback comparison.
+  Fixes a logic error where rollback could run when hh= was absent
+  from the signature.
+
+- **Descriptive verification causes.** DKIM2-Authentication-Results
+  now carries human-readable causes: `(signature mismatch)`,
+  `(header integrity mismatch)`, `(body integrity mismatch)`,
+  `(previous node dishonesty)`, `(envelope sender mismatch)`,
+  `(structural: key not found)`, `(structural: sequence gap)`, etc.
+
+- **Signer blocks on any failure.** pass → sign; fail, permerror or
+  temperror → skip signing. The message is still delivered
+  (SMFIS_CONTINUE), just unsigned.
+
+### Added
+
+- **hh_include (header hash exceptions).** Three-level exclusion model:
+  hardcoded defaults → hh_exclude.conf → hh_include.conf. A header
+  excluded by a prefix pattern (e.g. `X-MS-`) can be re-included by
+  an exact match in hh_include.conf (e.g. `X-MS-Exchange-SenderADCheck`).
+  New function `load_hh_includes()` and `dc_is_hh_included()` in
+  dc_shared.c.
+
+
 
 ## [0.7 - 11/07/2026]
 
