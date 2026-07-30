@@ -160,6 +160,12 @@ Message-Instance
 
 If the file is absent, only the built-in exclusions apply.
 
+
+**`/etc/DarkChain/hh_include.conf`** (optional) — A header excluded by 
+a prefix pattern (e.g. X-MS-) can be re-included by an exact match in 
+hh_include.conf (e.g. X-MS-Exchange-SenderADCheck).
+
+
 **`/etc/DarkChain/domains.conf`** (recommended) — the list of DKIM2-enabled
 domains served by this host. The verifier injects a
 `DKIM2-Authentication-Results` header **only** when the recipient domain is
