@@ -129,11 +129,19 @@ struct context
    /* --- Envelope (captured from SMTP session) --- */
    struct dc_envelope envelope;
 
-   /* --- Body hashing (relaxed only) --- */
-   EVP_MD_CTX *mdctx_body;
+   /* --- Body hashing --- */
+   /* Relaxed is always computed; simple is computed in parallel so the
+    * verifier can honour whichever body canonicalization the incoming
+    * DKIM2-Signature c= tag selects. Scan state that is canonicalization-
+    * independent (p_had_space, is_start_of_line) is shared; the per-mode
+    * state (pending_newlines, body_has_content) is duplicated. */
+   EVP_MD_CTX *mdctx_body;          /* relaxed */
+   EVP_MD_CTX *mdctx_body_simple;   /* simple  */
    long long body_size;   /* long long: int would overflow past 2GB */
-   int  pending_newlines;
-   int  body_has_content;
+   int  pending_newlines;           /* relaxed */
+   int  body_has_content;           /* relaxed */
+   int  pending_newlines_simple;
+   int  body_has_content_simple;
    int  p_had_space;
    int  is_start_of_line;
 
@@ -695,11 +703,14 @@ static sfsistat dc_connect(SMFICTX *ctx, char *hostname, _SOCK_ADDR *hostaddr)
 
    ps->mdctx_header = EVP_MD_CTX_new();
    ps->mdctx_body   = EVP_MD_CTX_new();
+   ps->mdctx_body_simple = EVP_MD_CTX_new();
 
-   if (ps->mdctx_header == NULL || ps->mdctx_body == NULL)
+   if (ps->mdctx_header == NULL || ps->mdctx_body == NULL ||
+       ps->mdctx_body_simple == NULL)
    {
       EVP_MD_CTX_free(ps->mdctx_header);
       EVP_MD_CTX_free(ps->mdctx_body);
+      EVP_MD_CTX_free(ps->mdctx_body_simple);
       free(ps);
       smfi_setpriv(ctx, NULL);
       return SMFIS_TEMPFAIL;
@@ -707,6 +718,7 @@ static sfsistat dc_connect(SMFICTX *ctx, char *hostname, _SOCK_ADDR *hostaddr)
 
    EVP_DigestInit_ex(ps->mdctx_header, EVP_sha256(), NULL);
    EVP_DigestInit_ex(ps->mdctx_body,   EVP_sha256(), NULL);
+   EVP_DigestInit_ex(ps->mdctx_body_simple, EVP_sha256(), NULL);
 
    ps->header_capacity = INITIAL_CAPACITY;
    ps->header_cnt = 0;
@@ -723,6 +735,7 @@ static sfsistat dc_connect(SMFICTX *ctx, char *hostname, _SOCK_ADDR *hostaddr)
       free(ps->envelope.rcpt_to);
       EVP_MD_CTX_free(ps->mdctx_header);
       EVP_MD_CTX_free(ps->mdctx_body);
+      EVP_MD_CTX_free(ps->mdctx_body_simple);
       free(ps);
       smfi_setpriv(ctx, NULL);
       return SMFIS_TEMPFAIL;
@@ -737,6 +750,7 @@ static sfsistat dc_connect(SMFICTX *ctx, char *hostname, _SOCK_ADDR *hostaddr)
       free(ps->envelope.rcpt_to);
       EVP_MD_CTX_free(ps->mdctx_header);
       EVP_MD_CTX_free(ps->mdctx_body);
+      EVP_MD_CTX_free(ps->mdctx_body_simple);
       free(ps);
       smfi_setpriv(ctx, NULL);   /* else dc_close would read freed memory */
       return SMFIS_TEMPFAIL;
@@ -833,6 +847,8 @@ static sfsistat dc_envfrom(SMFICTX *ctx, char **argv)
       ps->body_size = 0;
       ps->pending_newlines = 0;
       ps->body_has_content = 0;
+      ps->pending_newlines_simple = 0;
+      ps->body_has_content_simple = 0;
       ps->p_had_space = 0;
       ps->is_start_of_line = 0;
       ps->body_integrity = 0;
@@ -849,6 +865,11 @@ static sfsistat dc_envfrom(SMFICTX *ctx, char **argv)
          EVP_MD_CTX_reset(ps->mdctx_body);
          EVP_DigestInit_ex(ps->mdctx_body, EVP_sha256(), NULL);
       }
+      if (ps->mdctx_body_simple)
+      {
+         EVP_MD_CTX_reset(ps->mdctx_body_simple);
+         EVP_DigestInit_ex(ps->mdctx_body_simple, EVP_sha256(), NULL);
+      }
       if (ps->mdctx_header)
       {
          EVP_MD_CTX_reset(ps->mdctx_header);
@@ -863,6 +884,8 @@ static sfsistat dc_envfrom(SMFICTX *ctx, char **argv)
       ps->body_size = 0;
       ps->pending_newlines = 0;
       ps->body_has_content = 0;
+      ps->pending_newlines_simple = 0;
+      ps->body_has_content_simple = 0;
       ps->p_had_space = 0;
       ps->is_start_of_line = 0;
       ps->body_integrity = 0;
@@ -911,6 +934,16 @@ static sfsistat dc_envfrom(SMFICTX *ctx, char **argv)
          return SMFIS_TEMPFAIL;
       }
       EVP_DigestInit_ex(ps->mdctx_body, EVP_sha256(), NULL);
+   }
+   if (!ps->mdctx_body_simple)
+   {
+      ps->mdctx_body_simple = EVP_MD_CTX_new();
+      if (!ps->mdctx_body_simple)
+      {
+         syslog(LOG_ERR, "DC_ENVFROM: EVP_MD_CTX_new failed (body simple)");
+         return SMFIS_TEMPFAIL;
+      }
+      EVP_DigestInit_ex(ps->mdctx_body_simple, EVP_sha256(), NULL);
    }
    if (!ps->mdctx_header)
    {
@@ -2283,6 +2316,11 @@ static void dc_cleanup_message(struct context *priv)
    {
       EVP_MD_CTX_free(priv->mdctx_body);
       priv->mdctx_body = NULL;
+   }
+   if (priv->mdctx_body_simple)
+   {
+      EVP_MD_CTX_free(priv->mdctx_body_simple);
+      priv->mdctx_body_simple = NULL;
    }
    if (priv->mdctx_header)
    {
