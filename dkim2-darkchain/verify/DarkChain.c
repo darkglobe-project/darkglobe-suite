@@ -144,6 +144,10 @@ struct context
    int  body_has_content_simple;
    int  p_had_space;
    int  is_start_of_line;
+   /* Body canonicalization for the incoming hop, from the c= body part
+    * (header part is always relaxed per draft Section 3.3.5). Default 1
+    * (relaxed) so an unparsed/absent c= keeps the established behavior. */
+   int  i_body_relaxed;
 
    /* --- Header hashing (used in dc_eom for signature verify) --- */
    EVP_MD_CTX *mdctx_header;
@@ -757,6 +761,7 @@ static sfsistat dc_connect(SMFICTX *ctx, char *hostname, _SOCK_ADDR *hostaddr)
    }
 
    ps->is_localhost = 0;
+   ps->i_body_relaxed = 1;   /* relaxed until parsed from this message's c= */
    ps->msg_count = 0;
 
    /* Localhost detection */
@@ -851,6 +856,7 @@ static sfsistat dc_envfrom(SMFICTX *ctx, char **argv)
       ps->body_has_content_simple = 0;
       ps->p_had_space = 0;
       ps->is_start_of_line = 0;
+      ps->i_body_relaxed = 1;   /* default until this message's c= is parsed */
       ps->body_integrity = 0;
       ps->header_vfy = 0;
       ps->envelope_vfy = 0;
@@ -888,6 +894,7 @@ static sfsistat dc_envfrom(SMFICTX *ctx, char **argv)
       ps->body_has_content_simple = 0;
       ps->p_had_space = 0;
       ps->is_start_of_line = 0;
+      ps->i_body_relaxed = 1;   /* default until this message's c= is parsed */
       ps->body_integrity = 0;
       ps->header_vfy = 0;
       ps->envelope_vfy = 0;
@@ -1299,6 +1306,33 @@ static sfsistat dc_eoh(SMFICTX *ctx)
       }
    }
 
+   /* Determine body canonicalization for the incoming hop (max_hop) from its
+    * DKIM2-Signature c= tag, BEFORE the body streams in via dc_body(). The
+    * header part is always relaxed (draft Section 3.3.5); only the body part
+    * (after the mandatory '/') selects relaxed vs simple. Default stays relaxed
+    * if the tag is missing or malformed. */
+   if (ps->max_hop > 0)
+   {
+      for (int j = 0; j < ps->header_cnt; j++)
+      {
+         if (ps->headers[j].dc_type == DC_HDR_SIG &&
+             ps->headers[j].hop == ps->max_hop)
+         {
+            char c_tag[64] = "";
+            dc_get_tag_str(ps->headers[j].value, "c", c_tag, sizeof(c_tag));
+            const char *slash = strchr(c_tag, '/');
+            if (slash != NULL && strstr(slash + 1, "simple") != NULL)
+               ps->i_body_relaxed = 0;   /* body part is simple */
+            else
+               ps->i_body_relaxed = 1;   /* relaxed, or unparsable → default */
+            syslog(LOG_DEBUG, "DC_EOH: hop i=%d body canon = %s (c=%s)",
+                   ps->max_hop, ps->i_body_relaxed ? "relaxed" : "simple",
+                   c_tag[0] ? c_tag : "(none)");
+            break;
+         }
+      }
+   }
+
    clock_gettime(CLOCK_MONOTONIC, &cb_end);
    ps->cpu_ns += diff_ns(cb_start, cb_end);
 
@@ -1318,107 +1352,202 @@ static sfsistat dc_body(SMFICTX *ctx, unsigned char *bodyp, size_t bodylen)
 
    ps->body_size += bodylen;
 
-   register int l_pending   = ps->pending_newlines;
-   register int l_had_space  = ps->p_had_space;
-   register int l_is_start   = ps->is_start_of_line;
-   register int l_has_cont   = ps->body_has_content;
-
-   unsigned char r_buf[BODY_BUF_SIZE];
-   size_t r_idx = 0;
-
-   size_t i = 0;
-   while (i < bodylen)
+   /* Body canonicalization is a per-hop choice (draft Section 3.3.5): the
+    * incoming hop's c= selects relaxed or simple, resolved at EOH into
+    * i_body_relaxed. Only the selected digest is fed — one hop, one body
+    * canonicalization. The two branches below are fully autonomous (each with
+    * its own carry-over state), so should the DKIM2 WG ever allow different
+    * body canonicalizations within one hop, they can be run in cascade
+    * (both, sequentially) instead of the current if/else, with no change to
+    * the canonicalization logic itself. p_had_space / is_start_of_line are
+    * used only by the relaxed branch; simple emits bytes verbatim. */
+   if (ps->i_body_relaxed)
    {
-      unsigned char c = bodyp[i];
+      register int l_pending   = ps->pending_newlines;
+      register int l_had_space  = ps->p_had_space;
+      register int l_is_start   = ps->is_start_of_line;
+      register int l_has_cont   = ps->body_has_content;
 
-      if (c == '\r') { i++; continue; }
+      unsigned char r_buf[BODY_BUF_SIZE];
+      size_t r_idx = 0;
 
-      if (c == '\n')
+      size_t i = 0;
+      while (i < bodylen)
       {
-         l_had_space = 0;
-         l_is_start  = 1;
-         l_pending++;
-         i++;
-         continue;
-      }
+         unsigned char c = bodyp[i];
 
-      if (c == ' ' || c == '\t')
-      {
-         l_had_space = 1;
-         i++;
-         continue;
-      }
+         if (c == '\r') { i++; continue; }
 
-      size_t j = i + 1;
-      while (j < bodylen &&
-             bodyp[j] != '\r' && bodyp[j] != '\n' &&
-             bodyp[j] != ' '  && bodyp[j] != '\t')
-      {
-         j++;
-      }
-      size_t run = j - i;
-
-      while (l_pending > 0)
-      {
-         if (r_idx >= BODY_BUF_SIZE - 2)
+         if (c == '\n')
          {
-            EVP_DigestUpdate(ps->mdctx_body, r_buf, r_idx);
-            r_idx = 0;
+            l_had_space = 0;
+            l_is_start  = 1;
+            l_pending++;
+            i++;
+            continue;
          }
-         r_buf[r_idx++] = '\r';
-         r_buf[r_idx++] = '\n';
-         l_pending--;
-         l_has_cont = 1;
-      }
 
-      if (l_had_space)
-      {
-         if (r_idx >= BODY_BUF_SIZE)
+         if (c == ' ' || c == '\t')
          {
-            EVP_DigestUpdate(ps->mdctx_body, r_buf, r_idx);
-            r_idx = 0;
+            l_had_space = 1;
+            i++;
+            continue;
          }
-         r_buf[r_idx++] = ' ';
-         l_had_space = 0;
-      }
 
-      size_t space_left = BODY_BUF_SIZE - r_idx;
-      if (run <= space_left)
-      {
-         memcpy(r_buf + r_idx, bodyp + i, run);
-         r_idx += run;
-      }
-      else
-      {
-         memcpy(r_buf + r_idx, bodyp + i, space_left);
-         EVP_DigestUpdate(ps->mdctx_body, r_buf, BODY_BUF_SIZE);
-         r_idx = 0;
-         size_t remaining = run - space_left;
-         if (remaining >= BODY_BUF_SIZE)
+         size_t j = i + 1;
+         while (j < bodylen &&
+                bodyp[j] != '\r' && bodyp[j] != '\n' &&
+                bodyp[j] != ' '  && bodyp[j] != '\t')
          {
-            EVP_DigestUpdate(ps->mdctx_body, bodyp + i + space_left, remaining);
+            j++;
+         }
+         size_t run = j - i;
+
+         while (l_pending > 0)
+         {
+            if (r_idx >= BODY_BUF_SIZE - 2)
+            {
+               EVP_DigestUpdate(ps->mdctx_body, r_buf, r_idx);
+               r_idx = 0;
+            }
+            r_buf[r_idx++] = '\r';
+            r_buf[r_idx++] = '\n';
+            l_pending--;
+            l_has_cont = 1;
+         }
+
+         if (l_had_space)
+         {
+            if (r_idx >= BODY_BUF_SIZE)
+            {
+               EVP_DigestUpdate(ps->mdctx_body, r_buf, r_idx);
+               r_idx = 0;
+            }
+            r_buf[r_idx++] = ' ';
+            l_had_space = 0;
+         }
+
+         size_t space_left = BODY_BUF_SIZE - r_idx;
+         if (run <= space_left)
+         {
+            memcpy(r_buf + r_idx, bodyp + i, run);
+            r_idx += run;
          }
          else
          {
-            memcpy(r_buf, bodyp + i + space_left, remaining);
-            r_idx = remaining;
+            memcpy(r_buf + r_idx, bodyp + i, space_left);
+            EVP_DigestUpdate(ps->mdctx_body, r_buf, BODY_BUF_SIZE);
+            r_idx = 0;
+            size_t remaining = run - space_left;
+            if (remaining >= BODY_BUF_SIZE)
+            {
+               EVP_DigestUpdate(ps->mdctx_body, bodyp + i + space_left, remaining);
+            }
+            else
+            {
+               memcpy(r_buf, bodyp + i + space_left, remaining);
+               r_idx = remaining;
+            }
          }
+
+         l_has_cont = 1;
+         l_is_start = 0;
+         i = j;
       }
 
-      l_has_cont = 1;
-      l_is_start = 0;
-      i = j;
-   }
+      if (r_idx > 0)
+      {
+         EVP_DigestUpdate(ps->mdctx_body, r_buf, r_idx);
+      }
 
-   if (r_idx > 0)
+      ps->pending_newlines    = l_pending;
+      ps->p_had_space         = l_had_space;
+      ps->is_start_of_line    = l_is_start;
+      ps->body_has_content    = l_has_cont;
+   }
+   else
    {
-      EVP_DigestUpdate(ps->mdctx_body, r_buf, r_idx);
-   }
+      /* SIMPLE body canonicalization (RFC 6376 3.4.3): bytes are emitted
+       * verbatim — no whitespace collapse, no trailing-space stripping. The
+       * only transformation is deferring empty trailing lines (pending CRLFs
+       * flushed only when real content follows), so a run of blank lines at
+       * end-of-body is dropped by the EOM finalizer. State is the _simple
+       * carry-over set; spaces/tabs are part of the run, so a run breaks only
+       * on CR/LF. */
+      register int l_pending_s  = ps->pending_newlines_simple;
+      register int l_has_cont_s = ps->body_has_content_simple;
 
-   ps->pending_newlines    = l_pending;
-   ps->p_had_space         = l_had_space;
-   ps->is_start_of_line    = l_is_start;
-   ps->body_has_content    = l_has_cont;
+      unsigned char s_buf[BODY_BUF_SIZE];
+      size_t s_idx = 0;
+
+      size_t i = 0;
+      while (i < bodylen)
+      {
+         unsigned char c = bodyp[i];
+
+         if (c == '\r') { i++; continue; }
+
+         if (c == '\n')
+         {
+            l_pending_s++;
+            i++;
+            continue;
+         }
+
+         /* Run of any non-CRLF bytes (spaces and tabs included, verbatim) */
+         size_t j = i + 1;
+         while (j < bodylen && bodyp[j] != '\r' && bodyp[j] != '\n')
+            j++;
+         size_t run = j - i;
+
+         while (l_pending_s > 0)
+         {
+            if (s_idx >= BODY_BUF_SIZE - 2)
+            {
+               EVP_DigestUpdate(ps->mdctx_body_simple, s_buf, s_idx);
+               s_idx = 0;
+            }
+            s_buf[s_idx++] = '\r';
+            s_buf[s_idx++] = '\n';
+            l_pending_s--;
+            l_has_cont_s = 1;
+         }
+
+         size_t space_left = BODY_BUF_SIZE - s_idx;
+         if (run <= space_left)
+         {
+            memcpy(s_buf + s_idx, bodyp + i, run);
+            s_idx += run;
+         }
+         else
+         {
+            memcpy(s_buf + s_idx, bodyp + i, space_left);
+            EVP_DigestUpdate(ps->mdctx_body_simple, s_buf, BODY_BUF_SIZE);
+            s_idx = 0;
+            size_t remaining = run - space_left;
+            if (remaining >= BODY_BUF_SIZE)
+            {
+               EVP_DigestUpdate(ps->mdctx_body_simple, bodyp + i + space_left, remaining);
+            }
+            else
+            {
+               memcpy(s_buf, bodyp + i + space_left, remaining);
+               s_idx = remaining;
+            }
+         }
+
+         l_has_cont_s = 1;
+         i = j;
+      }
+
+      if (s_idx > 0)
+      {
+         EVP_DigestUpdate(ps->mdctx_body_simple, s_buf, s_idx);
+      }
+
+      ps->pending_newlines_simple = l_pending_s;
+      ps->body_has_content_simple = l_has_cont_s;
+   }
 
    clock_gettime(CLOCK_MONOTONIC, &cb_end);
    ps->cpu_ns += diff_ns(cb_start, cb_end);
