@@ -1572,20 +1572,39 @@ static sfsistat dc_eom(SMFICTX *ctx)
 
    syslog(LOG_DEBUG, "DC_EOM: localhost =%d", ps->is_localhost);
 
-   /* --- 0. FINALIZE BODY HASH --- */
-   if (ps->body_has_content)
-   {
-      EVP_DigestUpdate(ps->mdctx_body, "\r\n", 2);
-   }
-
+   /* --- 0. FINALIZE BODY HASH ---
+    * The incoming hop's c= (parsed at EOH into i_body_relaxed) selects which
+    * of the two parallel digests is the authoritative body hash for this
+    * message. Only the selected one is finalized and compared against bh=
+    * below; the other was computed in parallel but is discarded here. Each
+    * branch appends its own trailing CRLF, conditioned on its own
+    * body_has_content flag (a body with content ends in a single CRLF;
+    * an empty body does not get one). */
    unsigned char body_hash_bin[EVP_MAX_MD_SIZE];
    unsigned int  body_hash_len = 0;
+   EVP_MD_CTX *body_ctx;
 
-   if (EVP_DigestFinal_ex(ps->mdctx_body, body_hash_bin, &body_hash_len) != 1)
+   if (ps->i_body_relaxed)
+   {
+      if (ps->body_has_content)
+         EVP_DigestUpdate(ps->mdctx_body, "\r\n", 2);
+      body_ctx = ps->mdctx_body;
+   }
+   else
+   {
+      if (ps->body_has_content_simple)
+         EVP_DigestUpdate(ps->mdctx_body_simple, "\r\n", 2);
+      body_ctx = ps->mdctx_body_simple;
+   }
+
+   if (EVP_DigestFinal_ex(body_ctx, body_hash_bin, &body_hash_len) != 1)
    {
       syslog(LOG_ERR, "DC_EOM: Fatal OpenSSL error in body hash finalization");
       return SMFIS_TEMPFAIL;
    }
+   syslog(LOG_DEBUG, "DC_EOM: body hash finalized (%s canon)",
+          ps->i_body_relaxed ? "relaxed" : "simple");
+
 
    /* --- No chain? --- */
    if (ps->max_hop == 0)
