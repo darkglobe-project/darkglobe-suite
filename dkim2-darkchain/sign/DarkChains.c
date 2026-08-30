@@ -82,7 +82,6 @@ static int parse_loglevel(const char *s)
 
 /* Header hash exclusion config path */
 #define DC_HH_EXCLUDE_CONF  "/etc/DarkChains/hh_exclude.conf"
-#define DC_HH_INCLUDE_CONF  "/etc/DarkChains/hh_include.conf"
 #define NOLOCALSIGN  0
 
 /* ================================================================
@@ -138,6 +137,11 @@ struct dc_domain_key
 
 static struct dc_domain_key domain_table[DC_MAX_DOMAINS];
 static int domain_count = 0;
+/* Body canonicalization to sign with (header is always relaxed per draft
+ * Section 3.3.5). 0 = relaxed (default), 1 = simple, set once from the -S
+ * CLI flag and fixed for the process lifetime — the signer chooses the
+ * canonicalization, it does not receive it. */
+static int sign_body_simple = 0;
 /* --- DEFAULT DOMAIN (currently unused — reserved for future relay fallback) --- */
 static struct dc_domain_key default_dk;  /* Fallback for relay signing */
 static int default_dk_loaded = 0;
@@ -617,10 +621,6 @@ static sfsistat dcs_header(SMFICTX *ctx, char *headerf, char *headerv)
             if (slot->seq == 0) slot->seq = 1;
             if (slot->fr == 0)  slot->fr = 1;
          }
-         else if (strcasecmp(headerf, "DKIM2-Authentication-Results") == 0)
-         {
-            slot->dc_type = DC_HDR_AR;
-         }
       }
    }
 
@@ -653,68 +653,127 @@ static sfsistat dcs_body(SMFICTX *ctx, unsigned char *bodyp, size_t bodylen)
 
    ps->body_size += bodylen;
 
-   register int l_pending  = ps->pending_newlines;
-   register int l_had_space = ps->p_had_space;
-   register int l_is_start  = ps->is_start_of_line;
-   register int l_has_cont  = ps->body_has_content;
-
-   unsigned char r_buf[BODY_BUF_SIZE];
-   size_t r_idx = 0;
-
-   size_t i = 0;
-   while (i < bodylen)
+   /* The signer feeds a single body digest; which canonicalization it uses is
+    * a fixed process-wide choice (-S flag), not a per-message property. The two
+    * branches are autonomous. Relaxed is the established path, unchanged. */
+   if (!sign_body_simple)
    {
-      unsigned char c = bodyp[i];
-      if (c == '\r') { i++; continue; }
-      if (c == '\n')
-      {
-         l_had_space = 0; l_is_start = 1; l_pending++; i++;
-         continue;
-      }
-      if (c == ' ' || c == '\t') { l_had_space = 1; i++; continue; }
+      register int l_pending  = ps->pending_newlines;
+      register int l_had_space = ps->p_had_space;
+      register int l_is_start  = ps->is_start_of_line;
+      register int l_has_cont  = ps->body_has_content;
 
-      size_t j = i + 1;
-      while (j < bodylen && bodyp[j] != '\r' && bodyp[j] != '\n' &&
-             bodyp[j] != ' ' && bodyp[j] != '\t') j++;
-      size_t run = j - i;
+      unsigned char r_buf[BODY_BUF_SIZE];
+      size_t r_idx = 0;
 
-      while (l_pending > 0)
+      size_t i = 0;
+      while (i < bodylen)
       {
-         if (r_idx >= BODY_BUF_SIZE - 2)
-         { EVP_DigestUpdate(ps->mdctx_body, r_buf, r_idx); r_idx = 0; }
-         r_buf[r_idx++] = '\r'; r_buf[r_idx++] = '\n'; l_pending--;
-         l_has_cont = 1;
-      }
-      if (l_had_space)
-      {
-         if (r_idx >= BODY_BUF_SIZE)
-         { EVP_DigestUpdate(ps->mdctx_body, r_buf, r_idx); r_idx = 0; }
-         r_buf[r_idx++] = ' '; l_had_space = 0;
-      }
+         unsigned char c = bodyp[i];
+         if (c == '\r') { i++; continue; }
+         if (c == '\n')
+         {
+            l_had_space = 0; l_is_start = 1; l_pending++; i++;
+            continue;
+         }
+         if (c == ' ' || c == '\t') { l_had_space = 1; i++; continue; }
 
-      size_t space_left = BODY_BUF_SIZE - r_idx;
-      if (run <= space_left)
-      {
-         memcpy(r_buf + r_idx, bodyp + i, run); r_idx += run;
-      }
-      else
-      {
-         memcpy(r_buf + r_idx, bodyp + i, space_left);
-         EVP_DigestUpdate(ps->mdctx_body, r_buf, BODY_BUF_SIZE); r_idx = 0;
-         size_t rem = run - space_left;
-         if (rem >= BODY_BUF_SIZE)
-            EVP_DigestUpdate(ps->mdctx_body, bodyp + i + space_left, rem);
+         size_t j = i + 1;
+         while (j < bodylen && bodyp[j] != '\r' && bodyp[j] != '\n' &&
+                bodyp[j] != ' ' && bodyp[j] != '\t') j++;
+         size_t run = j - i;
+
+         while (l_pending > 0)
+         {
+            if (r_idx >= BODY_BUF_SIZE - 2)
+            { EVP_DigestUpdate(ps->mdctx_body, r_buf, r_idx); r_idx = 0; }
+            r_buf[r_idx++] = '\r'; r_buf[r_idx++] = '\n'; l_pending--;
+            l_has_cont = 1;
+         }
+         if (l_had_space)
+         {
+            if (r_idx >= BODY_BUF_SIZE)
+            { EVP_DigestUpdate(ps->mdctx_body, r_buf, r_idx); r_idx = 0; }
+            r_buf[r_idx++] = ' '; l_had_space = 0;
+         }
+
+         size_t space_left = BODY_BUF_SIZE - r_idx;
+         if (run <= space_left)
+         {
+            memcpy(r_buf + r_idx, bodyp + i, run); r_idx += run;
+         }
          else
-         { memcpy(r_buf, bodyp + i + space_left, rem); r_idx = rem; }
+         {
+            memcpy(r_buf + r_idx, bodyp + i, space_left);
+            EVP_DigestUpdate(ps->mdctx_body, r_buf, BODY_BUF_SIZE); r_idx = 0;
+            size_t rem = run - space_left;
+            if (rem >= BODY_BUF_SIZE)
+               EVP_DigestUpdate(ps->mdctx_body, bodyp + i + space_left, rem);
+            else
+            { memcpy(r_buf, bodyp + i + space_left, rem); r_idx = rem; }
+         }
+         l_has_cont = 1; l_is_start = 0; i = j;
       }
-      l_has_cont = 1; l_is_start = 0; i = j;
-   }
-   if (r_idx > 0) EVP_DigestUpdate(ps->mdctx_body, r_buf, r_idx);
+      if (r_idx > 0) EVP_DigestUpdate(ps->mdctx_body, r_buf, r_idx);
 
-   ps->pending_newlines = l_pending;
-   ps->p_had_space      = l_had_space;
-   ps->is_start_of_line = l_is_start;
-   ps->body_has_content = l_has_cont;
+      ps->pending_newlines = l_pending;
+      ps->p_had_space      = l_had_space;
+      ps->is_start_of_line = l_is_start;
+      ps->body_has_content = l_has_cont;
+   }
+   else
+   {
+      /* SIMPLE (RFC 6376 3.4.3): bytes verbatim — no whitespace collapse,
+       * no trailing-space stripping; only trailing empty lines are deferred
+       * (dropped at EOM). Spaces/tabs are part of the run, so a run breaks
+       * only on CR/LF. p_had_space / is_start_of_line are unused here. */
+      register int l_pending_s  = ps->pending_newlines;
+      register int l_has_cont_s = ps->body_has_content;
+
+      unsigned char s_buf[BODY_BUF_SIZE];
+      size_t s_idx = 0;
+
+      size_t i = 0;
+      while (i < bodylen)
+      {
+         unsigned char c = bodyp[i];
+         if (c == '\r') { i++; continue; }
+         if (c == '\n') { l_pending_s++; i++; continue; }
+
+         size_t j = i + 1;
+         while (j < bodylen && bodyp[j] != '\r' && bodyp[j] != '\n') j++;
+         size_t run = j - i;
+
+         while (l_pending_s > 0)
+         {
+            if (s_idx >= BODY_BUF_SIZE - 2)
+            { EVP_DigestUpdate(ps->mdctx_body, s_buf, s_idx); s_idx = 0; }
+            s_buf[s_idx++] = '\r'; s_buf[s_idx++] = '\n'; l_pending_s--;
+            l_has_cont_s = 1;
+         }
+
+         size_t space_left = BODY_BUF_SIZE - s_idx;
+         if (run <= space_left)
+         {
+            memcpy(s_buf + s_idx, bodyp + i, run); s_idx += run;
+         }
+         else
+         {
+            memcpy(s_buf + s_idx, bodyp + i, space_left);
+            EVP_DigestUpdate(ps->mdctx_body, s_buf, BODY_BUF_SIZE); s_idx = 0;
+            size_t rem = run - space_left;
+            if (rem >= BODY_BUF_SIZE)
+               EVP_DigestUpdate(ps->mdctx_body, bodyp + i + space_left, rem);
+            else
+            { memcpy(s_buf, bodyp + i + space_left, rem); s_idx = rem; }
+         }
+         l_has_cont_s = 1; i = j;
+      }
+      if (s_idx > 0) EVP_DigestUpdate(ps->mdctx_body, s_buf, s_idx);
+
+      ps->pending_newlines = l_pending_s;
+      ps->body_has_content = l_has_cont_s;
+   }
 
    return SMFIS_CONTINUE;
 }
@@ -856,14 +915,8 @@ static sfsistat dcs_eom(SMFICTX *ctx)
          prev_verdict = "fail";
       }
 
-      if (verdict_conflict)
-         snprintf(auth_result_value, sizeof(auth_result_value),
-                  "i=%d; %s; dkim2=%s (verdict conflict)",
-                  N, my_hostname, prev_verdict);
-      else
-         snprintf(auth_result_value, sizeof(auth_result_value),
-                  "i=%d; %s; dkim2=%s",
-                  N, my_hostname, prev_verdict);
+      snprintf(auth_result_value, sizeof(auth_result_value),
+               "i=%d; %s; dkim2=%s", N, my_hostname, prev_verdict);
       syslog(LOG_INFO,
              "DCS_EOM: Case B — sigs=%d, prev_verdict=%s. Signing as i=%d",
              ps->found_prev_sigs, prev_verdict, N);
@@ -878,15 +931,14 @@ static sfsistat dcs_eom(SMFICTX *ctx)
       syslog(LOG_INFO, "DCS_EOM: Case C — local mail, i=1");
    }
 
-   /* Broken chain: pass → sign, any failure → skip.
-    * The message is still delivered (SMFIS_CONTINUE), just unsigned.
+   /* Broken chain: if the verifier reported fail or permerror,
+    * the chain is compromised — don't extend it with a new signature.
     * Internal-Status was already stripped above.
     */
    if (strcmp(ps->verifier_verdict, "fail") == 0 ||
-       strcmp(ps->verifier_verdict, "permerror") == 0 ||
-       strcmp(ps->verifier_verdict, "temperror") == 0)
+       strcmp(ps->verifier_verdict, "permerror") == 0)
    {
-      syslog(LOG_NOTICE, "DCS_EOM: Verifier verdict=%s — skip signing",
+      syslog(LOG_NOTICE, "DCS_EOM: Verifier verdict=%s — chain broken, skip signing",
              ps->verifier_verdict);
       return SMFIS_CONTINUE;
    }
@@ -934,8 +986,6 @@ static sfsistat dcs_eom(SMFICTX *ctx)
              ps->envelope.mail_from);
       return SMFIS_CONTINUE;
    }
-
-   /* Auth result is complete from Case B/C — no header.d= needed */
 
    /* ---- ENVELOPE REWRITING FOR RELAY ----
     *
@@ -1158,10 +1208,14 @@ static sfsistat dcs_eom(SMFICTX *ctx)
 
    /* ---- 5. BUILD DKIM2-Signature (without b=) ---- */
    long t_stamp = (long)time(NULL);
+   /* Header canonicalization is always relaxed (draft Section 3.3.5); the body
+    * part follows the -S process-wide choice. Must match the canonicalization
+    * actually used to compute bh_b64 above. */
+   const char *c_tag = sign_body_simple ? "relaxed/simple" : "relaxed/relaxed";
    char sig_value_no_b[2048];
    snprintf(sig_value_no_b, sizeof(sig_value_no_b),
-            "i=%d; a=%s; c=relaxed/relaxed; d=%s; s=%s; t=%ld; h=%s; bh=%s; hh=%s; b=",
-            N, ALGORITHM, dk->domain, dk->selector, t_stamp, H_FIELDS, bh_b64, hh_b64);
+            "i=%d; a=%s; c=%s; d=%s; s=%s; t=%ld; h=%s; bh=%s; hh=%s; b=",
+            N, ALGORITHM, c_tag, dk->domain, dk->selector, t_stamp, H_FIELDS, bh_b64, hh_b64);
 
    /* ---- 6. ACCUMULATE SIGNING INPUT ---- */
    size_t buf_est = (size_t)(ps->header_cnt + rt_count + 10)
@@ -1185,19 +1239,16 @@ static sfsistat dcs_eom(SMFICTX *ctx)
       }                                                                    \
    } while(0)
 
-   /* a) All DKIM2-Authentication-Results i=1..N ascending */
-   for (int i = 1; i <= N; i++)
+   /* a) Previous DKIM2-Signatures i=1..N-1 ascending */
+   for (int i = 1; i < N; i++)
       for (int j = 0; j < ps->header_cnt; j++)
-         if (ps->headers[j].dc_type == DC_HDR_AR && ps->headers[j].hop == i)
-            APPEND_CANON(ps->headers[j].name, ps->headers[j].value, 1);
-   /* Include our own auth result if generated (Case B/C) */
-   if (generate_auth_result)
-      APPEND_CANON("DKIM2-Authentication-Results", auth_result_value, 1);
+         if (ps->headers[j].dc_type == DC_HDR_SIG && ps->headers[j].hop == i)
+         { APPEND_CANON(ps->headers[j].name, ps->headers[j].value, 1); break; }
 
-   /* b) Our DKIM2-Sig-mf (i=N only) */
+   /* b) Our DKIM2-Sig-mf */
    APPEND_CANON("DKIM2-Sig-mf", mf_value, 1);
 
-   /* c) Our DKIM2-Sig-rt (i=N only) */
+   /* c) Our DKIM2-Sig-rt */
    for (int r = 0; r < rt_count; r++)
       APPEND_CANON("DKIM2-Sig-rt", rt_values[r], 1);
 
@@ -1240,13 +1291,7 @@ static sfsistat dcs_eom(SMFICTX *ctx)
               ps->headers[j].used_for_signature = 1; break; }
    }
 
-   /* f) Previous DKIM2-Signatures i=1..N-1 ascending */
-   for (int i = 1; i < N; i++)
-      for (int j = 0; j < ps->header_cnt; j++)
-         if (ps->headers[j].dc_type == DC_HDR_SIG && ps->headers[j].hop == i)
-         { APPEND_CANON(ps->headers[j].name, ps->headers[j].value, 1); break; }
-
-   /* g) Our DKIM2-Signature with b= empty, NO CRLF */
+   /* f) Our DKIM2-Signature with b= empty, NO CRLF */
    APPEND_CANON("DKIM2-Signature", sig_value_no_b, 0);
    #undef APPEND_CANON
 
@@ -1372,7 +1417,7 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    }
 
    char xsigned[100] = "";
-   snprintf (xsigned, sizeof(xsigned), "DarkChain " DC_VERSION " i=%d", N);
+   snprintf (xsigned, sizeof(xsigned), "DarkChain 0.7 i=%d", N);
    smfi_addheader(ctx, "X-Signed", xsigned);
 
    /* Timing */
@@ -1447,13 +1492,15 @@ static sfsistat dcs_negotiate(SMFICTX *ctx,
 
 static void dcs_usage(const char *prog)
 {
-   fprintf(stderr, "usage: %s [-u user] [-p socket] [-l level] [-m umask] [-f] [-L]\n"
+   fprintf(stderr, "usage: %s [-u user] [-p socket] [-l level] [-m umask] [-f] [-L] [-S]\n"
                    "  -u user    Run as user (default: smmsp)\n"
                    "  -p socket  Milter socket (default: unix:/var/spool/DarkChains/sock)\n"
                    "  -l level   Log level: debug|info|notice|warning|err (default: notice)\n"
                    "  -m umask   Socket umask in octal (default: 0177)\n"
                    "  -f         Run in foreground (no daemon)\n"
-                   "  -L         Log to stderr (in addition to syslog)\n", prog);
+                   "  -L         Log to stderr (in addition to syslog)\n"
+                   "  -S         Sign body with simple canonicalization (c=relaxed/simple;\n"
+                   "             default is relaxed/relaxed)\n", prog);
    exit(1);
 }
 
@@ -1479,7 +1526,7 @@ int main(int argc, char *argv[])
    int log_stderr = 0;
    mode_t sock_umask = 0177;
 
-   while ((i_get = getopt(argc, argv, "p:u:l:m:fLh")) != -1)
+   while ((i_get = getopt(argc, argv, "p:u:l:m:fLSh")) != -1)
    {
       switch (i_get)
       {
@@ -1500,6 +1547,7 @@ int main(int argc, char *argv[])
          case 'm': sock_umask = (mode_t)strtol(optarg, NULL, 8); break;
          case 'f': foreground = 1; break;
          case 'L': log_stderr = 1; break;
+         case 'S': sign_body_simple = 1; break;
          default: dcs_usage(argv[0]);
       }
    }
@@ -1570,7 +1618,6 @@ int main(int argc, char *argv[])
 
    /* Load header hash exclusion patterns */
    load_hh_excludes(DC_HH_EXCLUDE_CONF);
-   load_hh_includes(DC_HH_INCLUDE_CONF);
 
    /* Load optional SRS secret (forward-path forge-resistance) */
    load_srs_secret(DC_SRS_KEY_CONF);
