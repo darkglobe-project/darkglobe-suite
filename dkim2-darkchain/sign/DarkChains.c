@@ -82,6 +82,7 @@ static int parse_loglevel(const char *s)
 
 /* Header hash exclusion config path */
 #define DC_HH_EXCLUDE_CONF  "/etc/DarkChains/hh_exclude.conf"
+#define DC_HH_INCLUDE_CONF  "/etc/DarkChains/hh_include.conf"
 #define NOLOCALSIGN  0
 
 /* ================================================================
@@ -616,6 +617,10 @@ static sfsistat dcs_header(SMFICTX *ctx, char *headerf, char *headerv)
             if (slot->seq == 0) slot->seq = 1;
             if (slot->fr == 0)  slot->fr = 1;
          }
+         else if (strcasecmp(headerf, "DKIM2-Authentication-Results") == 0)
+         {
+            slot->dc_type = DC_HDR_AR;
+         }
       }
    }
 
@@ -851,8 +856,14 @@ static sfsistat dcs_eom(SMFICTX *ctx)
          prev_verdict = "fail";
       }
 
-      snprintf(auth_result_value, sizeof(auth_result_value),
-               "i=%d; %s; dkim2=%s", N, my_hostname, prev_verdict);
+      if (verdict_conflict)
+         snprintf(auth_result_value, sizeof(auth_result_value),
+                  "i=%d; %s; dkim2=%s (verdict conflict)",
+                  N, my_hostname, prev_verdict);
+      else
+         snprintf(auth_result_value, sizeof(auth_result_value),
+                  "i=%d; %s; dkim2=%s",
+                  N, my_hostname, prev_verdict);
       syslog(LOG_INFO,
              "DCS_EOM: Case B — sigs=%d, prev_verdict=%s. Signing as i=%d",
              ps->found_prev_sigs, prev_verdict, N);
@@ -867,14 +878,15 @@ static sfsistat dcs_eom(SMFICTX *ctx)
       syslog(LOG_INFO, "DCS_EOM: Case C — local mail, i=1");
    }
 
-   /* Broken chain: if the verifier reported fail or permerror,
-    * the chain is compromised — don't extend it with a new signature.
+   /* Broken chain: pass → sign, any failure → skip.
+    * The message is still delivered (SMFIS_CONTINUE), just unsigned.
     * Internal-Status was already stripped above.
     */
    if (strcmp(ps->verifier_verdict, "fail") == 0 ||
-       strcmp(ps->verifier_verdict, "permerror") == 0)
+       strcmp(ps->verifier_verdict, "permerror") == 0 ||
+       strcmp(ps->verifier_verdict, "temperror") == 0)
    {
-      syslog(LOG_NOTICE, "DCS_EOM: Verifier verdict=%s — chain broken, skip signing",
+      syslog(LOG_NOTICE, "DCS_EOM: Verifier verdict=%s — skip signing",
              ps->verifier_verdict);
       return SMFIS_CONTINUE;
    }
@@ -922,6 +934,8 @@ static sfsistat dcs_eom(SMFICTX *ctx)
              ps->envelope.mail_from);
       return SMFIS_CONTINUE;
    }
+
+   /* Auth result is complete from Case B/C — no header.d= needed */
 
    /* ---- ENVELOPE REWRITING FOR RELAY ----
     *
@@ -1171,16 +1185,19 @@ static sfsistat dcs_eom(SMFICTX *ctx)
       }                                                                    \
    } while(0)
 
-   /* a) Previous DKIM2-Signatures i=1..N-1 ascending */
-   for (int i = 1; i < N; i++)
+   /* a) All DKIM2-Authentication-Results i=1..N ascending */
+   for (int i = 1; i <= N; i++)
       for (int j = 0; j < ps->header_cnt; j++)
-         if (ps->headers[j].dc_type == DC_HDR_SIG && ps->headers[j].hop == i)
-         { APPEND_CANON(ps->headers[j].name, ps->headers[j].value, 1); break; }
+         if (ps->headers[j].dc_type == DC_HDR_AR && ps->headers[j].hop == i)
+            APPEND_CANON(ps->headers[j].name, ps->headers[j].value, 1);
+   /* Include our own auth result if generated (Case B/C) */
+   if (generate_auth_result)
+      APPEND_CANON("DKIM2-Authentication-Results", auth_result_value, 1);
 
-   /* b) Our DKIM2-Sig-mf */
+   /* b) Our DKIM2-Sig-mf (i=N only) */
    APPEND_CANON("DKIM2-Sig-mf", mf_value, 1);
 
-   /* c) Our DKIM2-Sig-rt */
+   /* c) Our DKIM2-Sig-rt (i=N only) */
    for (int r = 0; r < rt_count; r++)
       APPEND_CANON("DKIM2-Sig-rt", rt_values[r], 1);
 
@@ -1223,7 +1240,13 @@ static sfsistat dcs_eom(SMFICTX *ctx)
               ps->headers[j].used_for_signature = 1; break; }
    }
 
-   /* f) Our DKIM2-Signature with b= empty, NO CRLF */
+   /* f) Previous DKIM2-Signatures i=1..N-1 ascending */
+   for (int i = 1; i < N; i++)
+      for (int j = 0; j < ps->header_cnt; j++)
+         if (ps->headers[j].dc_type == DC_HDR_SIG && ps->headers[j].hop == i)
+         { APPEND_CANON(ps->headers[j].name, ps->headers[j].value, 1); break; }
+
+   /* g) Our DKIM2-Signature with b= empty, NO CRLF */
    APPEND_CANON("DKIM2-Signature", sig_value_no_b, 0);
    #undef APPEND_CANON
 
@@ -1349,7 +1372,7 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    }
 
    char xsigned[100] = "";
-   snprintf (xsigned, sizeof(xsigned), "DarkChain 0.7 i=%d", N);
+   snprintf (xsigned, sizeof(xsigned), "DarkChain " DC_VERSION " i=%d", N);
    smfi_addheader(ctx, "X-Signed", xsigned);
 
    /* Timing */
@@ -1547,6 +1570,7 @@ int main(int argc, char *argv[])
 
    /* Load header hash exclusion patterns */
    load_hh_excludes(DC_HH_EXCLUDE_CONF);
+   load_hh_includes(DC_HH_INCLUDE_CONF);
 
    /* Load optional SRS secret (forward-path forge-resistance) */
    load_srs_secret(DC_SRS_KEY_CONF);
