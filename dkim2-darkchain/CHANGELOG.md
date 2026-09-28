@@ -1,6 +1,6 @@
 # Changelog DarkChain / DarkChains (DKIM2)
 
-## [1.0 - 26/07/2026]
+## [1.0 - 28/09/2026]
 
 First stable release, aligned with draft-moccia-dkim2-deployment-profile-07.
 NOTE: This version is not interoperable with the previous ones.
@@ -57,7 +57,7 @@ NOTE: This version is not interoperable with the previous ones.
   an exact match in hh_include.conf (e.g. `X-MS-Exchange-SenderADCheck`).
   New function `load_hh_includes()` and `dc_is_hh_included()` in
   dc_shared.c.
-
+- **strict body.** Added handling for simple bodies
 
 
 ## [0.7 - 11/07/2026]
