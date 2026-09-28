@@ -18,6 +18,7 @@
  * ================================================================ */
 
 #define DC_MAX_HOPS          15     /* Maximum i= value                      */
+#define DC_VERSION           "1.0"  /* DarkChain suite version               */
 #define DC_MAX_RT           500     /* Maximum RCPT TO per hop               */
 #define DC_MAX_SEQ           20     /* Maximum seq= per hop for DKIM2-Mod    */
 #define DC_MAX_FR             2     /* Maximum fr= frames per Mod entry      */
@@ -30,8 +31,9 @@
 #define MAX_HEADER_COUNT    800     /* Hard ceiling for DoS protection       */
 #define INITIAL_CAPACITY    100     /* Starting allocation for header slots  */
 
-/* Header hash exclusion list */
+/* Header hash exclusion and inclusion lists */
 #define DC_HH_MAX_EXCLUDE    64
+#define DC_HH_MAX_INCLUDE    32
 
 /* ================================================================
  * DKIM2 HEADER TYPE CODES
@@ -42,6 +44,7 @@
 #define DC_HDR_MF             2     /* DKIM2-Sig-mf                          */
 #define DC_HDR_RT             3     /* DKIM2-Sig-rt                          */
 #define DC_HDR_MOD            4     /* DKIM2-Mod                             */
+#define DC_HDR_AR             5     /* DKIM2-Authentication-Results          */
 
 /* ================================================================
  * DATA STRUCTURES
@@ -114,6 +117,7 @@ int  dc_relaxed_domain_match(const char *d_domain, const char *mf_addr);
  * ================================================================ */
 
 void load_hh_excludes(const char *path);
+void load_hh_includes(const char *path);
 int  dc_is_hh_excluded(const char *name);
 char *dc_compute_hh(struct header_slot *headers, int header_cnt);
 int   dc_extract_addresses(const char *hdr, char addrs[][DC_MAX_ADDR], int max_addrs);
@@ -130,6 +134,8 @@ int  cmp_rt_by_v(const void *a, const void *b);
 
 extern struct dc_hh_exclude hh_excludes[];
 extern int hh_exclude_count;
+extern struct dc_hh_exclude hh_includes[];
+extern int hh_include_count;
 extern const char *hh_default_excludes[];
 extern const char *hh_single_fields[];
 

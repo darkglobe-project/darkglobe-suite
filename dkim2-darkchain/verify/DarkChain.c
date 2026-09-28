@@ -86,6 +86,7 @@ static int parse_loglevel(const char *s)
 
 /* Header hash exclusion config path */
 #define DC_HH_EXCLUDE_CONF  "/etc/DarkChain/hh_exclude.conf"
+#define DC_HH_INCLUDE_CONF  "/etc/DarkChain/hh_include.conf"
 
 /* Domain table: the verifier only needs to know which domains are
  * DKIM2-enabled on this host, so it can decide whether to inject a
@@ -189,6 +190,9 @@ struct dc_hop_index
 
    struct header_slot *mod[DC_MAX_MOD];
    int mod_count;
+
+   struct header_slot *ar[DC_MAX_HOPS];
+   int ar_count;
 };
 
 
@@ -1089,6 +1093,8 @@ static sfsistat dc_header(SMFICTX *ctx, char *headerf, char *headerv)
       else if (strcasecmp(headerf, "DKIM2-Sig-mf") == 0)    hdr_type = DC_HDR_MF;
       else if (strcasecmp(headerf, "DKIM2-Sig-rt") == 0)    hdr_type = DC_HDR_RT;
       else if (strcasecmp(headerf, "DKIM2-Mod") == 0)       hdr_type = DC_HDR_MOD;
+      else if (strcasecmp(headerf, "DKIM2-Authentication-Results") == 0)
+                                                             hdr_type = DC_HDR_AR;
 
       if (hdr_type != DC_HDR_OTHER)
       {
@@ -1567,6 +1573,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
 
    const char *dkim2_verdict = "none";
    char dkim2_details[512] = "no DKIM2 headers";
+   int reject_on_enforce = 0;  /* 1 = structural/dishonesty → REJECT */
    char signing_domain[256] = "";
    EVP_PKEY *pubkey = NULL;
 
@@ -1615,7 +1622,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
 
    if (ps->chain_broken)
    {
-      dkim2_verdict = "permerror";
+      dkim2_verdict = "permerror"; reject_on_enforce = 1;
       snprintf(dkim2_details, sizeof(dkim2_details), "chain structure broken");
       goto inject_result;
    }
@@ -1658,6 +1665,11 @@ static sfsistat dc_eom(SMFICTX *ctx)
             syslog(LOG_NOTICE, "DC_EOM: DKIM2-Mod count exceeds %d", DC_MAX_MOD);
          }
       }
+      else if (h->dc_type == DC_HDR_AR && h->hop <= ps->max_hop)
+      {
+         if (idx.ar_count < DC_MAX_HOPS)
+            idx.ar[idx.ar_count++] = h;
+      }
    }
 
    /* Re-check: the index-building loop above can break the chain
@@ -1666,7 +1678,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
     * "permerror". */
    if (ps->chain_broken)
    {
-      dkim2_verdict = "permerror";
+      dkim2_verdict = "permerror"; reject_on_enforce = 1;
       snprintf(dkim2_details, sizeof(dkim2_details),
                "DKIM2-Mod count exceeds %d", DC_MAX_MOD);
       goto inject_result;
@@ -1674,7 +1686,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
 
    if (!idx.sig)
    {
-      dkim2_verdict = "permerror";
+      dkim2_verdict = "permerror"; reject_on_enforce = 1;
       snprintf(dkim2_details, sizeof(dkim2_details),
                "no DKIM2-Signature at i=%d", ps->max_hop);
       goto inject_result;
@@ -1682,7 +1694,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
 
    if (!idx.mf)
    {
-      dkim2_verdict = "permerror";
+      dkim2_verdict = "permerror"; reject_on_enforce = 1;
       snprintf(dkim2_details, sizeof(dkim2_details),
                "no DKIM2-Sig-mf at i=%d", ps->max_hop);
       goto inject_result;
@@ -1712,14 +1724,14 @@ static sfsistat dc_eom(SMFICTX *ctx)
 
    if (sig_d[0] == '\0' || sig_s[0] == '\0')
    {
-      dkim2_verdict = "permerror";
+      dkim2_verdict = "permerror"; reject_on_enforce = 1;
       snprintf(dkim2_details, sizeof(dkim2_details),
                "missing d= or s= in DKIM2-Signature");
       goto inject_result;
    }
    if (sig_b[0] == '\0' || sig_bh[0] == '\0')
    {
-      dkim2_verdict = "permerror";
+      dkim2_verdict = "permerror"; reject_on_enforce = 1;
       snprintf(dkim2_details, sizeof(dkim2_details),
                "missing b= or bh= in DKIM2-Signature");
       goto inject_result;
@@ -1781,7 +1793,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
          ps->body_integrity = 0;
          dkim2_verdict = "fail";
          snprintf(dkim2_details, sizeof(dkim2_details),
-                  "body hash mismatch i=%d d=%s", ps->max_hop, sig_d);
+                  "body integrity mismatch i=%d d=%s", ps->max_hop, sig_d);
          syslog(LOG_NOTICE, "DC_EOM: Body hash MISMATCH (i=%d d=%s)", ps->max_hop, sig_d);
          goto inject_result;
       }
@@ -1805,7 +1817,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
 
       if (dns_ok == -2)
       {
-         dkim2_verdict = "permerror";
+         dkim2_verdict = "permerror"; reject_on_enforce = 1;
          snprintf(dkim2_details, sizeof(dkim2_details),
                   "no key record %s._domainkey.%s", sig_s, sig_d);
          syslog(LOG_NOTICE, "DC_EOM: No key record for %s._domainkey.%s", sig_s, sig_d);
@@ -1825,7 +1837,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
       {
          /* Successful lookup, empty p= : revoked key — permanent
           * condition per RFC 6376 semantics, not a temperror. */
-         dkim2_verdict = "permerror";
+         dkim2_verdict = "permerror"; reject_on_enforce = 1;
          snprintf(dkim2_details, sizeof(dkim2_details),
                   "key revoked %s._domainkey.%s", sig_s, sig_d);
          syslog(LOG_NOTICE, "DC_EOM: Revoked key (empty p=) for %s._domainkey.%s",
@@ -1836,7 +1848,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
       pubkey = decode_dns_key(dns_key, is_ed25519);
       if (!pubkey)
       {
-         dkim2_verdict = "permerror";
+         dkim2_verdict = "permerror"; reject_on_enforce = 1;
          snprintf(dkim2_details, sizeof(dkim2_details),
                   "key decode failed d=%s s=%s", sig_d, sig_s);
          goto inject_result;
@@ -1848,7 +1860,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
    int sig_bin_len = decode_base64_sig(sig_b, sig_binary, sizeof(sig_binary));
    if (sig_bin_len <= 0)
    {
-      dkim2_verdict = "permerror";
+      dkim2_verdict = "permerror"; reject_on_enforce = 1;
       snprintf(dkim2_details, sizeof(dkim2_details), "b= base64 decode failed");
       goto cleanup_key;
    }
@@ -1875,7 +1887,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
             {
                if (strncasecmp(token, "DKIM2-", 6) == 0)
                {
-                  dkim2_verdict = "permerror";
+                  dkim2_verdict = "permerror"; reject_on_enforce = 1;
                   snprintf(dkim2_details, sizeof(dkim2_details),
                            "h= contains DKIM2 header: %s", token);
                   syslog(LOG_NOTICE, "DC_EOM: h= contains DKIM2 header '%s' — permerror",
@@ -1940,12 +1952,11 @@ static sfsistat dc_eom(SMFICTX *ctx)
             FEED_DATA(canon_buf, (size_t)clen);                 \
       } while(0)
 
-      /* a) Previous DKIM2-Signatures: i=1..N-1, ascending */
-      for (int i = 1; i < ps->max_hop; i++)
-      {
-         if (idx.prev_sig[i - 1])
-            FEED_HEADER_SLOT(idx.prev_sig[i - 1], 1);
-      }
+      /* a) All DKIM2-Authentication-Results i=1..N ascending */
+      for (int i = 1; i <= ps->max_hop; i++)
+         for (int a = 0; a < idx.ar_count; a++)
+            if (idx.ar[a]->hop == i)
+               FEED_HEADER_SLOT(idx.ar[a], 1);
 
       /* b) DKIM2-Sig-mf at i=N */
       FEED_HEADER_SLOT(idx.mf, 1);
@@ -1974,7 +1985,14 @@ static sfsistat dc_eom(SMFICTX *ctx)
          }
       }
 
-      /* f) Current DKIM2-Signature with b= emptied, NO trailing CRLF */
+      /* f) Previous DKIM2-Signatures: i=1..N-1, ascending */
+      for (int i = 1; i < ps->max_hop; i++)
+      {
+         if (idx.prev_sig[i - 1])
+            FEED_HEADER_SLOT(idx.prev_sig[i - 1], 1);
+      }
+
+      /* g) Current DKIM2-Signature with b= emptied, NO trailing CRLF */
       {
          int clen = canonicalize_sig_for_verify(
             idx.sig->name, idx.sig->value, canon_buf, sizeof(canon_buf));
@@ -2048,11 +2066,12 @@ static sfsistat dc_eom(SMFICTX *ctx)
    {
       dkim2_verdict = "fail";
       snprintf(dkim2_details, sizeof(dkim2_details),
-               "signature verification failed i=%d d=%s", ps->max_hop, sig_d);
+               "signature mismatch i=%d d=%s", ps->max_hop, sig_d);
       goto cleanup_key;
    }
 
    /* --- 6b. HEADER HASH (hh=) VERIFICATION --- */
+   int hh_verified = 0;
    {
       char sig_hh[256] = "";
       dc_get_tag_str(idx.sig->value, "hh", sig_hh, sizeof(sig_hh));
@@ -2065,6 +2084,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
          {
             if (strcmp(sig_hh, computed_hh) == 0)
             {
+               hh_verified = 1;
                syslog(LOG_INFO, "DC_EOM: Header hash (hh=) MATCH (i=%d)",
                       ps->max_hop);
             }
@@ -2076,7 +2096,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
                       ps->max_hop, sig_d, sig_hh, computed_hh);
                dkim2_verdict = "fail";
                snprintf(dkim2_details, sizeof(dkim2_details),
-                        "header hash mismatch i=%d d=%s", ps->max_hop, sig_d);
+                        "header integrity mismatch i=%d d=%s", ps->max_hop, sig_d);
                free(computed_hh);
                goto cleanup_key;
             }
@@ -2102,8 +2122,12 @@ static sfsistat dc_eom(SMFICTX *ctx)
       }
    }
 
-   /* --- 6c. ROLLBACK VERIFICATION --- */
-   if (ps->max_hop >= 2)
+   /* --- 6c. ROLLBACK VERIFICATION ---
+    * Only meaningful when hh= is present and verified: without a
+    * confirmed header hash, the received header set is not a
+    * trustworthy input for rollback comparison.
+    */
+   if (ps->max_hop >= 2 && hh_verified)
    {
       char prev_hh[256] = "";
       for (int j = 0; j < ps->header_cnt; j++)
@@ -2136,8 +2160,9 @@ static sfsistat dc_eom(SMFICTX *ctx)
                       "prev=[%.32s...] rolled=[%.32s...]",
                       ps->max_hop, prev_hh, rolled_hh);
                dkim2_verdict = "fail";
+               reject_on_enforce = 1;
                snprintf(dkim2_details, sizeof(dkim2_details),
-                        "rollback hh mismatch i=%d d=%s", ps->max_hop, sig_d);
+                        "previous node dishonesty i=%d d=%s", ps->max_hop, sig_d);
                free(rolled_hh);
                goto cleanup_key;
             }
@@ -2241,13 +2266,13 @@ static sfsistat dc_eom(SMFICTX *ctx)
    {
       dkim2_verdict = "fail";
       snprintf(dkim2_details, sizeof(dkim2_details),
-               "envelope mismatch i=%d d=%s", ps->max_hop, sig_d);
+               "envelope sender mismatch i=%d d=%s", ps->max_hop, sig_d);
    }
    else
    {
       dkim2_verdict = "fail";
       snprintf(dkim2_details, sizeof(dkim2_details),
-               "verification failed i=%d d=%s", ps->max_hop, sig_d);
+               "verification undetermined i=%d d=%s", ps->max_hop, sig_d);
    }
 
 cleanup_key:
@@ -2318,10 +2343,19 @@ inject_result:
    {
       int next_hop = (ps->max_hop > 0) ? ps->max_hop + 1 : 1;
 
-      char ar_string[512];
-      snprintf(ar_string, sizeof(ar_string),
-               "i=%d; %s; dkim2=%s",
-               next_hop, my_hostname, dkim2_verdict);
+      char ar_string[1024];
+      if (strcmp(dkim2_verdict, "none") == 0)
+      {
+         snprintf(ar_string, sizeof(ar_string),
+                  "i=%d; %s; dkim2=none",
+                  next_hop, my_hostname);
+      }
+      else
+      {
+         snprintf(ar_string, sizeof(ar_string),
+                  "i=%d; %s; dkim2=%s (%s)",
+                  next_hop, my_hostname, dkim2_verdict, dkim2_details);
+      }
 
       smfi_addheader(ctx, "DKIM2-Authentication-Results", ar_string);
 
@@ -2357,22 +2391,25 @@ inject_result:
       smfi_addheader(ctx, "X-DarkChain-Internal-Status", h_val);
    }
 
-   /* --- 9. ENFORCEMENT --- */
-   /* Null-sender (DSN/bounce) messages are NEVER rejected regardless
-    * of verification outcome.  RFC 5321 §6.1 loop prevention requires
-    * that bounces always be accepted.  draft-moccia §3.5.1:
-    * "The verifier MUST NOT issue a rejection response to a
-    *  null-sender message regardless of verification outcome."
+   /* --- 9. GRADUATED ENFORCEMENT (§3.5.2) ---
+    *
+    * Three cases:
+    *   1. Structural permerror or proven dishonesty (reject_on_enforce=1)
+    *      → REJECT in enforcement mode
+    *   2. Undetermined-cause failure (reject_on_enforce=0, fail)
+    *      → CONTINUE always, even with ENFORCE=1
+    *   3. temperror → TEMPFAIL in enforcement mode
+    *
+    * Null-sender (DSN) messages are NEVER rejected per RFC 5321 §6.1.
     */
    if (ENFORCE && ps->is_localhost == 0 &&
        ps->envelope.mail_from[0] != '\0')
    {
-      if (strcmp(dkim2_verdict, "fail") == 0 ||
-          strcmp(dkim2_verdict, "permerror") == 0)
+      if (reject_on_enforce)
       {
          syslog(LOG_NOTICE,
-                "DC_EOM: ENFORCE reject — dkim2=%s d=%s",
-                dkim2_verdict, signing_domain);
+                "DC_EOM: ENFORCE reject — dkim2=%s (%s)",
+                dkim2_verdict, dkim2_details);
          smfi_setreply(ctx, "550", "5.7.1",
                        "DKIM2 verification failed");
          return SMFIS_REJECT;
@@ -2380,11 +2417,18 @@ inject_result:
       if (strcmp(dkim2_verdict, "temperror") == 0)
       {
          syslog(LOG_NOTICE,
-                "DC_EOM: ENFORCE tempfail — dkim2=%s",
-                dkim2_verdict);
+                "DC_EOM: ENFORCE tempfail — dkim2=%s (%s)",
+                dkim2_verdict, dkim2_details);
          smfi_setreply(ctx, "451", "4.7.1",
                        "DKIM2 temporary verification error");
          return SMFIS_TEMPFAIL;
+      }
+      /* Undetermined-cause failure: deliver with result recorded */
+      if (strcmp(dkim2_verdict, "fail") == 0)
+      {
+         syslog(LOG_NOTICE,
+                "DC_EOM: ENFORCE deliver (undetermined) — dkim2=%s (%s)",
+                dkim2_verdict, dkim2_details);
       }
    }
 
@@ -2653,6 +2697,7 @@ int main(int argc, char *argv[])
 
    /* Load header hash exclusion patterns */
    load_hh_excludes(DC_HH_EXCLUDE_CONF);
+   load_hh_includes(DC_HH_INCLUDE_CONF);
 
    syslog(LOG_INFO, "DarkChain inbound verifier starting on %s", pc_oconn);
 

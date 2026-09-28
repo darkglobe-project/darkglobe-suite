@@ -18,6 +18,9 @@
 struct dc_hh_exclude hh_excludes[DC_HH_MAX_EXCLUDE];
 int hh_exclude_count = 0;
 
+struct dc_hh_exclude hh_includes[DC_HH_MAX_INCLUDE];
+int hh_include_count = 0;
+
 const char *hh_default_excludes[] = {
    "Received", "Return-Path", "Authentication-Results",
    "DKIM-Signature", "DKIM2-", "ARC-", NULL
@@ -467,6 +470,57 @@ void load_hh_excludes(const char *path)
           path);
 }
 
+void load_hh_includes(const char *path)
+{
+   hh_include_count = 0;
+
+   FILE *fp = fopen(path, "r");
+   if (!fp)
+   {
+      syslog(LOG_INFO, "DC_SHARED: no hh_include file at %s", path);
+      return;
+   }
+   char line[MAX_HEADER_NAME];
+   while (fgets(line, sizeof(line), fp) && hh_include_count < DC_HH_MAX_INCLUDE)
+   {
+      char *p = line;
+      while (*p == ' ' || *p == '\t') p++;
+      size_t len = strlen(p);
+      while (len > 0 && (p[len-1] == '\n' || p[len-1] == '\r' ||
+                         p[len-1] == ' '  || p[len-1] == '\t'))
+         len--;
+      if (len == 0 || p[0] == '#') continue;
+      p[len] = '\0';
+
+      securecpy(hh_includes[hh_include_count].pattern, p, MAX_HEADER_NAME);
+      hh_includes[hh_include_count].is_prefix = (len > 0 && p[len - 1] == '-') ? 1 : 0;
+      hh_includes[hh_include_count].match_len = len;
+      hh_include_count++;
+   }
+   fclose(fp);
+   syslog(LOG_INFO, "DC_SHARED: hh_include: %d exception patterns from %s",
+          hh_include_count, path);
+}
+
+static int dc_is_hh_included(const char *name)
+{
+   for (int i = 0; i < hh_include_count; i++)
+   {
+      if (hh_includes[i].is_prefix)
+      {
+         if (strncasecmp(name, hh_includes[i].pattern,
+                         hh_includes[i].match_len) == 0)
+            return 1;
+      }
+      else
+      {
+         if (strcasecmp(name, hh_includes[i].pattern) == 0)
+            return 1;
+      }
+   }
+   return 0;
+}
+
 int dc_is_hh_excluded(const char *name)
 {
    for (int i = 0; i < hh_exclude_count; i++)
@@ -475,12 +529,21 @@ int dc_is_hh_excluded(const char *name)
       {
          if (strncasecmp(name, hh_excludes[i].pattern,
                          hh_excludes[i].match_len) == 0)
+         {
+            /* Excluded — but check for include exception */
+            if (dc_is_hh_included(name))
+               return 0;
             return 1;
+         }
       }
       else
       {
          if (strcasecmp(name, hh_excludes[i].pattern) == 0)
+         {
+            if (dc_is_hh_included(name))
+               return 0;
             return 1;
+         }
       }
    }
    return 0;
