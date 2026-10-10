@@ -23,6 +23,7 @@
 #include <pwd.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <locale.h>
 
 #include <libmilter/mfapi.h>
 #include <openssl/hmac.h>
@@ -565,6 +566,14 @@ static void usage(const char *prog)
 
 int main(int argc, char *argv[])
 {
+   /* Pin the C locale.  Domain comparison here is ASCII case-insensitive
+    * (strcasecmp against the local-domain list and the SRS domain), and
+    * under a single-byte LC_CTYPE strcase* folds octets >= 0x80, so an
+    * internationalized domain could compare equal to a different one.
+    * Nothing else calls setlocale, so this makes the current behaviour
+    * explicit rather than incidental. */
+   setlocale(LC_ALL, "C");
+
    const char *user = USER;
    const char *conn = OCONN;
    int c;
