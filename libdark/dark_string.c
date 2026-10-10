@@ -75,16 +75,21 @@ void unfold_header(char *h)
    char *src = h, *dst = h;
    while (*src)
    {
-      if (*src == '\r' && *(src + 1) == '\n' && isspace((unsigned char)*(src + 2)))
+      /* A fold is CRLF (or a lone LF) followed by WSP, and WSP is SP or
+       * HTAB only — see dark_is_wsp in dark_common.h for why isspace()
+       * is the wrong test here.  The consuming loops use the same
+       * predicate, so they can never run past the CR that starts the
+       * next fold or ends the value. */
+      if (*src == '\r' && *(src + 1) == '\n' && dark_is_wsp((unsigned char)*(src + 2)))
       {
          src += 2;
-         while (isspace((unsigned char)*src)) src++;
+         while (dark_is_wsp((unsigned char)*src)) src++;
          *dst++ = ' ';
       }
-      else if (*src == '\n' && isspace((unsigned char)*(src + 1)))
+      else if (*src == '\n' && dark_is_wsp((unsigned char)*(src + 1)))
       {
          src++;
-         while (isspace((unsigned char)*src)) src++;
+         while (dark_is_wsp((unsigned char)*src)) src++;
          *dst++ = ' ';
       }
       else if (*src == '\r' && *(src + 1) == '\n')

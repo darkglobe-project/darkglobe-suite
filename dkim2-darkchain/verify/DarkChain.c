@@ -36,8 +36,8 @@
  *      mode this MUST return SMFIS_REJECT immediately without
  *      waiting for dc_eom().
  *
- *   3. dc_eoh(): chain continuity errors (missing DKIM2-Signature
- *      or DKIM2-Sig-mf at a required hop) currently set
+ *   3. dc_eoh(): chain continuity errors (missing DKIM2-Chain-Sig
+ *      or DKIM2-Chain-mf at a required hop) currently set
  *      chain_broken.  In enforcement mode these SHOULD return
  *      SMFIS_REJECT immediately to avoid processing the body
  *      of a message that will be rejected anyway.
@@ -90,7 +90,7 @@ static int parse_loglevel(const char *s)
 
 /* Domain table: the verifier only needs to know which domains are
  * DKIM2-enabled on this host, so it can decide whether to inject a
- * DKIM2-Authentication-Results record. It does NOT need the private keys
+ * DKIM2-Chain-Results record. It does NOT need the private keys
  * (it never signs), so it loads only the domain names. The conf file is
  * shared with the signer; a symlink
  *   /etc/DarkChain/domains.conf -> /etc/DarkChains/domains.conf
@@ -133,7 +133,7 @@ struct context
    /* --- Body hashing --- */
    /* Relaxed is always computed; simple is computed in parallel so the
     * verifier can honour whichever body canonicalization the incoming
-    * DKIM2-Signature c= tag selects. Scan state that is canonicalization-
+    * DKIM2-Chain-Sig c= tag selects. Scan state that is canonicalization-
     * independent (p_had_space, is_start_of_line) is shared; the per-mode
     * state (pending_newlines, body_has_content) is duplicated. */
    EVP_MD_CTX *mdctx_body;          /* relaxed */
@@ -215,14 +215,14 @@ static int  dc_domain_count = 0;
  * Line format matches the signer: "domain selector keypath"; we keep
  * only the first field. Missing file is not fatal: a host with no
  * DKIM2 domains (e.g. a list-only domain) simply has an empty table,
- * and the verifier will then inject no DKIM2-AR. */
+ * and the verifier will then inject no DKIM2-Chain-Results. */
 static int dc_load_domains(const char *conf_path)
 {
    FILE *fp = fopen(conf_path, "r");
    if (!fp)
    {
       syslog(LOG_INFO, "DC_MAIN: no domain table at %s (%s) — "
-             "DKIM2-AR injection disabled", conf_path, strerror(errno));
+             "DKIM2-Chain-Results injection disabled", conf_path, strerror(errno));
       dc_domain_count = 0;
       return 0;
    }
@@ -413,7 +413,7 @@ static int dc_check_dns_key_hash(const char *d, const char *s, const char *sig_a
  * ================================================================ */
 
 /*
- * Rollback DKIM2-Mod at a given hop and compute hh= of the
+ * Rollback DKIM2-Chain-Mod at a given hop and compute hh= of the
  * previous state.
  *
  * Applied in REVERSE seq= order (highest seq first) because
@@ -599,7 +599,7 @@ static char *dc_rollback_hh(struct header_slot *headers, int header_cnt, int hop
    if (work_cnt > 1)
       qsort(work, work_cnt, sizeof(struct header_slot *), cmp_header_hh);
 
-   /* Reorder duplicate groups using DKIM2-Mod (for hops < target hop) */
+   /* Reorder duplicate groups using DKIM2-Chain-Mod (for hops < target hop) */
    int grp_start = 0;
    while (grp_start < work_cnt)
    {
@@ -1063,9 +1063,19 @@ static sfsistat dc_header(SMFICTX *ctx, char *headerf, char *headerv)
    slot->fr = 0;
    slot->is_new = 0;
 
-   /* ---- Classify DKIM2-* headers ---- */
+   /* ---- Classify our own chain headers ----
+    *
+    * The gate matches the DKIM2-Chain- namespace only, never the bare
+    * DKIM2- prefix.  A DKIM2-Signature emitted by a DKIM2-core signer
+    * belongs to a different mechanism and is an ordinary header here, so
+    * it neither enters the chain index nor counts against the size cap.
+    *
+    * The hh= exclusion list stays wider (hh_default_excludes still carries
+    * "DKIM2-"): foreign chain headers accumulate one per hop, exactly like
+    * ARC-, so they must stay out of the header hash regardless.
+    */
 
-   if (strncasecmp(headerf, "DKIM2-", 6) == 0)
+   if (strncasecmp(headerf, "DKIM2-Chain-", 12) == 0)
    {
       size_t hdr_bytes = strlen(headerf) + 2 + strlen(headerv);
       ps->dkim2_header_bytes += hdr_bytes;
@@ -1083,17 +1093,17 @@ static sfsistat dc_header(SMFICTX *ctx, char *headerf, char *headerv)
       /* Determine the structural type by name FIRST.  Only the four
        * signed chain headers participate in hop numbering and chain
        * continuity.  Other DKIM2-* headers — notably
-       * DKIM2-Authentication-Results, unsigned and injectable by any
+       * DKIM2-Chain-Results, unsigned and injectable by any
        * peer, and unknown future extensions — must not raise max_hop
        * nor set chain_broken: an injected trace header would otherwise
        * poison the chain (permerror on legitimate mail, reject in
        * enforcement mode). */
       int hdr_type = DC_HDR_OTHER;
-      if      (strcasecmp(headerf, "DKIM2-Signature") == 0) hdr_type = DC_HDR_SIG;
-      else if (strcasecmp(headerf, "DKIM2-Sig-mf") == 0)    hdr_type = DC_HDR_MF;
-      else if (strcasecmp(headerf, "DKIM2-Sig-rt") == 0)    hdr_type = DC_HDR_RT;
-      else if (strcasecmp(headerf, "DKIM2-Mod") == 0)       hdr_type = DC_HDR_MOD;
-      else if (strcasecmp(headerf, "DKIM2-Authentication-Results") == 0)
+      if      (strcasecmp(headerf, "DKIM2-Chain-Sig") == 0) hdr_type = DC_HDR_SIG;
+      else if (strcasecmp(headerf, "DKIM2-Chain-mf") == 0)    hdr_type = DC_HDR_MF;
+      else if (strcasecmp(headerf, "DKIM2-Chain-rt") == 0)    hdr_type = DC_HDR_RT;
+      else if (strcasecmp(headerf, "DKIM2-Chain-Mod") == 0)       hdr_type = DC_HDR_MOD;
+      else if (strcasecmp(headerf, "DKIM2-Chain-Results") == 0)
                                                              hdr_type = DC_HDR_AR;
 
       if (hdr_type != DC_HDR_OTHER)
@@ -1120,7 +1130,7 @@ static sfsistat dc_header(SMFICTX *ctx, char *headerf, char *headerv)
                if (slot->v > DC_MAX_RT)
                {
                   ps->chain_broken = 1;
-                  syslog(LOG_NOTICE, "DC_HEADER: DKIM2-Sig-rt v=%d exceeds limit", slot->v);
+                  syslog(LOG_NOTICE, "DC_HEADER: DKIM2-Chain-rt v=%d exceeds limit", slot->v);
                }
             }
             else if (hdr_type == DC_HDR_MOD)
@@ -1138,7 +1148,7 @@ static sfsistat dc_header(SMFICTX *ctx, char *headerf, char *headerv)
                if (slot->seq > DC_MAX_SEQ || slot->fr > DC_MAX_FR)
                {
                   ps->chain_broken = 1;
-                  syslog(LOG_NOTICE, "DC_HEADER: DKIM2-Mod seq=%d fr=%d exceeds limits",
+                  syslog(LOG_NOTICE, "DC_HEADER: DKIM2-Chain-Mod seq=%d fr=%d exceeds limits",
                          slot->seq, slot->fr);
                }
             }
@@ -1188,12 +1198,12 @@ static sfsistat dc_eoh(SMFICTX *ctx)
          if (!found_sig)
          {
             ps->chain_broken = 1;
-            syslog(LOG_NOTICE, "DC_EOH: Chain gap — no DKIM2-Signature at i=%d", i);
+            syslog(LOG_NOTICE, "DC_EOH: Chain gap — no DKIM2-Chain-Sig at i=%d", i);
             break;
          }
       }
 
-      /* Each hop must have exactly one DKIM2-Sig-mf */
+      /* Each hop must have exactly one DKIM2-Chain-mf */
       for (int i = 1; i <= ps->max_hop; i++)
       {
          int found_mf = 0;
@@ -1207,13 +1217,13 @@ static sfsistat dc_eoh(SMFICTX *ctx)
          if (found_mf != 1)
          {
             ps->chain_broken = 1;
-            syslog(LOG_NOTICE, "DC_EOH: Expected 1 DKIM2-Sig-mf at i=%d, found %d",
+            syslog(LOG_NOTICE, "DC_EOH: Expected 1 DKIM2-Chain-mf at i=%d, found %d",
                    i, found_mf);
             break;
          }
       }
 
-      /* Check v= continuity for DKIM2-Sig-rt */
+      /* Check v= continuity for DKIM2-Chain-rt */
       if (!ps->chain_broken)
       {
          for (int i = 1; i <= ps->max_hop; i++)
@@ -1235,14 +1245,14 @@ static sfsistat dc_eoh(SMFICTX *ctx)
             {
                ps->chain_broken = 1;
                syslog(LOG_NOTICE,
-                      "DC_EOH: DKIM2-Sig-rt gap at i=%d: %d headers but max v=%d",
+                      "DC_EOH: DKIM2-Chain-rt gap at i=%d: %d headers but max v=%d",
                       i, rt_count, max_v);
                break;
             }
          }
       }
 
-      /* Check seq= and fr= continuity for DKIM2-Mod */
+      /* Check seq= and fr= continuity for DKIM2-Chain-Mod */
       if (!ps->chain_broken)
       {
          for (int i = 1; i <= ps->max_hop; i++)
@@ -1273,7 +1283,7 @@ static sfsistat dc_eoh(SMFICTX *ctx)
             {
                ps->chain_broken = 1;
                syslog(LOG_NOTICE,
-                      "DC_EOH: DKIM2-Mod seq= gap at i=%d: %d seqs but max seq=%d",
+                      "DC_EOH: DKIM2-Chain-Mod seq= gap at i=%d: %d seqs but max seq=%d",
                       i, seq_count, max_seq);
                break;
             }
@@ -1302,7 +1312,7 @@ static sfsistat dc_eoh(SMFICTX *ctx)
                   {
                      ps->chain_broken = 1;
                      syslog(LOG_NOTICE,
-                            "DC_EOH: DKIM2-Mod fr= gap at i=%d seq=%d %s: "
+                            "DC_EOH: DKIM2-Chain-Mod fr= gap at i=%d seq=%d %s: "
                             "%d frames but max fr=%d",
                             i, s, is_new ? "new" : "del", fr_count, max_fr);
                   }
@@ -1313,7 +1323,7 @@ static sfsistat dc_eoh(SMFICTX *ctx)
    }
 
    /* Determine body canonicalization for the incoming hop (max_hop) from its
-    * DKIM2-Signature c= tag, BEFORE the body streams in via dc_body(). The
+    * DKIM2-Chain-Sig c= tag, BEFORE the body streams in via dc_body(). The
     * header part is always relaxed (draft Section 3.3.5); only the body part
     * (after the mandatory '/') selects relaxed vs simple. Default stays relaxed
     * if the tag is missing or malformed. */
@@ -1662,7 +1672,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
          else if (!ps->chain_broken)
          {
             ps->chain_broken = 1;
-            syslog(LOG_NOTICE, "DC_EOM: DKIM2-Mod count exceeds %d", DC_MAX_MOD);
+            syslog(LOG_NOTICE, "DC_EOM: DKIM2-Chain-Mod count exceeds %d", DC_MAX_MOD);
          }
       }
       else if (h->dc_type == DC_HDR_AR && h->hop <= ps->max_hop)
@@ -1680,7 +1690,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
    {
       dkim2_verdict = "permerror"; reject_on_enforce = 1;
       snprintf(dkim2_details, sizeof(dkim2_details),
-               "DKIM2-Mod count exceeds %d", DC_MAX_MOD);
+               "DKIM2-Chain-Mod count exceeds %d", DC_MAX_MOD);
       goto inject_result;
    }
 
@@ -1688,7 +1698,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
    {
       dkim2_verdict = "permerror"; reject_on_enforce = 1;
       snprintf(dkim2_details, sizeof(dkim2_details),
-               "no DKIM2-Signature at i=%d", ps->max_hop);
+               "no DKIM2-Chain-Sig at i=%d", ps->max_hop);
       goto inject_result;
    }
 
@@ -1696,7 +1706,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
    {
       dkim2_verdict = "permerror"; reject_on_enforce = 1;
       snprintf(dkim2_details, sizeof(dkim2_details),
-               "no DKIM2-Sig-mf at i=%d", ps->max_hop);
+               "no DKIM2-Chain-mf at i=%d", ps->max_hop);
       goto inject_result;
    }
 
@@ -1726,14 +1736,14 @@ static sfsistat dc_eom(SMFICTX *ctx)
    {
       dkim2_verdict = "permerror"; reject_on_enforce = 1;
       snprintf(dkim2_details, sizeof(dkim2_details),
-               "missing d= or s= in DKIM2-Signature");
+               "missing d= or s= in DKIM2-Chain-Sig");
       goto inject_result;
    }
    if (sig_b[0] == '\0' || sig_bh[0] == '\0')
    {
       dkim2_verdict = "permerror"; reject_on_enforce = 1;
       snprintf(dkim2_details, sizeof(dkim2_details),
-               "missing b= or bh= in DKIM2-Signature");
+               "missing b= or bh= in DKIM2-Chain-Sig");
       goto inject_result;
    }
 
@@ -1777,7 +1787,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
       }
       else
       {
-         syslog(LOG_INFO, "DC_EOM: No t= timestamp in DKIM2-Signature i=%d",
+         syslog(LOG_INFO, "DC_EOM: No t= timestamp in DKIM2-Chain-Sig i=%d",
                 ps->max_hop);
       }
    }
@@ -1885,12 +1895,18 @@ static sfsistat dc_eom(SMFICTX *ctx)
 
             if (*token != '\0')
             {
-               if (strncasecmp(token, "DKIM2-", 6) == 0)
+               /* Only our own namespace is forbidden in h=: the structural
+                * chain headers are covered by the fixed signed set and must
+                * not be listed again.  A DKIM2-Signature from a DKIM2-core
+                * signer is a foreign header and may legitimately appear in
+                * that signer's h=, so a wider match here would reject
+                * conforming mail under enforcement. */
+               if (strncasecmp(token, "DKIM2-Chain-", 12) == 0)
                {
                   dkim2_verdict = "permerror"; reject_on_enforce = 1;
                   snprintf(dkim2_details, sizeof(dkim2_details),
-                           "h= contains DKIM2 header: %s", token);
-                  syslog(LOG_NOTICE, "DC_EOM: h= contains DKIM2 header '%s' — permerror",
+                           "h= contains chain header: %s", token);
+                  syslog(LOG_NOTICE, "DC_EOM: h= contains chain header '%s' — permerror",
                          token);
                   goto cleanup_key;
                }
@@ -1952,20 +1968,20 @@ static sfsistat dc_eom(SMFICTX *ctx)
             FEED_DATA(canon_buf, (size_t)clen);                 \
       } while(0)
 
-      /* a) All DKIM2-Authentication-Results i=1..N ascending */
+      /* a) All DKIM2-Chain-Results i=1..N ascending */
       for (int i = 1; i <= ps->max_hop; i++)
          for (int a = 0; a < idx.ar_count; a++)
             if (idx.ar[a]->hop == i)
                FEED_HEADER_SLOT(idx.ar[a], 1);
 
-      /* b) DKIM2-Sig-mf at i=N */
+      /* b) DKIM2-Chain-mf at i=N */
       FEED_HEADER_SLOT(idx.mf, 1);
 
-      /* c) DKIM2-Sig-rt at i=N, sorted by v= */
+      /* c) DKIM2-Chain-rt at i=N, sorted by v= */
       for (int r = 0; r < idx.rt_count; r++)
          FEED_HEADER_SLOT(idx.rt[r], 1);
 
-      /* d) DKIM2-Mod with i<=N, canonical order */
+      /* d) DKIM2-Chain-Mod with i<=N, canonical order */
       for (int m = 0; m < idx.mod_count; m++)
          FEED_HEADER_SLOT(idx.mod[m], 1);
 
@@ -1985,14 +2001,14 @@ static sfsistat dc_eom(SMFICTX *ctx)
          }
       }
 
-      /* f) Previous DKIM2-Signatures: i=1..N-1, ascending */
+      /* f) Previous DKIM2-Chain-Sigs: i=1..N-1, ascending */
       for (int i = 1; i < ps->max_hop; i++)
       {
          if (idx.prev_sig[i - 1])
             FEED_HEADER_SLOT(idx.prev_sig[i - 1], 1);
       }
 
-      /* g) Current DKIM2-Signature with b= emptied, NO trailing CRLF */
+      /* g) Current DKIM2-Chain-Sig with b= emptied, NO trailing CRLF */
       {
          int clen = canonicalize_sig_for_verify(
             idx.sig->name, idx.sig->value, canon_buf, sizeof(canon_buf));
@@ -2117,7 +2133,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
       }
       else
       {
-         syslog(LOG_INFO, "DC_EOM: No hh= in DKIM2-Signature i=%d (skipping)",
+         syslog(LOG_INFO, "DC_EOM: No hh= in DKIM2-Chain-Sig i=%d (skipping)",
                 ps->max_hop);
       }
    }
@@ -2172,7 +2188,7 @@ static sfsistat dc_eom(SMFICTX *ctx)
       else
       {
          syslog(LOG_INFO,
-                "DC_EOM: No hh= in DKIM2-Signature i=%d, rollback skipped",
+                "DC_EOM: No hh= in DKIM2-Chain-Sig i=%d, rollback skipped",
                 ps->max_hop - 1);
       }
    }
@@ -2284,7 +2300,7 @@ cleanup_key:
 
 inject_result:
 
-   /* --- 7b. STRIP IMPLAUSIBLE DKIM2-AUTHENTICATION-RESULTS --- */
+   /* --- 7b. STRIP IMPLAUSIBLE DKIM2-CHAIN-RESULTS --- */
    /* AR is unsigned trace: any peer can inject it.  max_hop is derived
     * from signed structural headers only (see dc_header), so an injected
     * AR cannot poison the chain — but it must not travel further either:
@@ -2310,7 +2326,7 @@ inject_result:
       for (int j = 0; j < ps->header_cnt; j++)
       {
          if (strcasecmp(ps->headers[j].name,
-                        "DKIM2-Authentication-Results") != 0)
+                        "DKIM2-Chain-Results") != 0)
             continue;
          ar_idx++;
 
@@ -2318,7 +2334,7 @@ inject_result:
          if (ar_hop < 0 || ar_hop > ps->max_hop + 1)
          {
             syslog(LOG_NOTICE,
-                   "DC_EOM: Stripping implausible DKIM2-Auth-Results "
+                   "DC_EOM: Stripping implausible DKIM2-Chain-Results "
                    "(occurrence %d, i=%d, max_hop=%d) — spurious injection",
                    ar_idx, ar_hop, ps->max_hop);
             ar_del[ar_del_cnt++] = ar_idx;
@@ -2328,15 +2344,15 @@ inject_result:
       /* Delete highest milter index first: smfi_chgheader indexes
        * occurrences per name and deletions shift later indices. */
       for (int k = ar_del_cnt - 1; k >= 0; k--)
-         smfi_chgheader(ctx, "DKIM2-Authentication-Results", ar_del[k], NULL);
+         smfi_chgheader(ctx, "DKIM2-Chain-Results", ar_del[k], NULL);
    }
 
-   /* --- 8. INJECT DKIM2-AUTHENTICATION-RESULTS --- */
+   /* --- 8. INJECT DKIM2-CHAIN-RESULTS --- */
    /* Only inject if this host is DKIM2-enabled for the recipient domain.
     * Inbound MTA sessions are per recipient domain, so rcpt_to[0] is
     * representative. A domain that is not in the table (e.g. a list-only
     * domain like pacedisarmo.org co-hosted with a DKIM2 domain) must NOT
-    * inject a DKIM2-AR: the chain begins at the first DKIM2-enabled hop. */
+    * inject a DKIM2-Chain-Results: the chain begins at the first DKIM2-enabled hop. */
    if (ps->is_localhost == 0 &&
        ps->envelope.rcpt_count > 0 &&
        dc_domain_enabled(ps->envelope.rcpt_to[0]))
@@ -2357,7 +2373,7 @@ inject_result:
                   next_hop, my_hostname, dkim2_verdict, dkim2_details);
       }
 
-      smfi_addheader(ctx, "DKIM2-Authentication-Results", ar_string);
+      smfi_addheader(ctx, "DKIM2-Chain-Results", ar_string);
 
       /* Timing header */
       clock_gettime(CLOCK_MONOTONIC, &ts_end);
@@ -2552,6 +2568,15 @@ void cleanup_and_exit(int sig)
 
 int main(int argc, char *argv[])
 {
+   /* Pin the C locale.  Canonicalization and address comparison rely on
+    * ctype and strcase* behaving as pure ASCII: under a single-byte
+    * LC_CTYPE those routines classify octets >= 0x80, which would
+    * case-fold or collapse continuation bytes of a UTF-8 sequence and
+    * silently corrupt the hash on legitimate mail.  Nothing here calls
+    * setlocale otherwise, so today the process already runs in "C" —
+    * this makes that a decision rather than an accident. */
+   setlocale(LC_ALL, "C");
+
    tzset();
 
    int i_get = 0, i_ret = 0;

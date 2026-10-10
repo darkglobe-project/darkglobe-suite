@@ -37,6 +37,24 @@
 #include <grp.h>
 #include <arpa/inet.h>
 #include <stdbool.h>
+#include <locale.h>
+
+/* ================================================================
+ * FOLDING WHITESPACE
+ *
+ * RFC 5234 defines WSP as SP / HTAB, and RFC 5322 folding as CRLF
+ * followed by WSP.  <ctype.h> isspace() is wider (it also accepts VT,
+ * FF, CR and LF) and is locale-dependent besides, so using it to decide
+ * what counts as folding makes the unfolder disagree with
+ * canonicalize_header_relaxed, which tests SP and HTAB explicitly.  Two
+ * functions in the same suite disagreeing on what a fold is will one day
+ * produce two different canonical forms for the same header.
+ * ================================================================ */
+
+static inline int dark_is_wsp(int c)
+{
+   return (c == ' ' || c == '\t');
+}
 
 /* ================================================================
  * BUFFER SIZE CONSTANTS

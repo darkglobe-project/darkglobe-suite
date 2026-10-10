@@ -125,7 +125,7 @@ int canonicalize_header_relaxed(const char *name, const char *value,
 }
 
 /*
- * Canonicalize a DKIM2-Signature (or AMS) for verification:
+ * Canonicalize a DKIM2-Chain-Sig (or AMS) for verification:
  * zeroes the b= tag value, then applies relaxed canonicalization.
  */
 int canonicalize_sig_for_verify(const char *name, const char *value,

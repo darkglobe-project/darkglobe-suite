@@ -21,12 +21,12 @@
  * mail), it signs as i=1.
  *
  * Signed header set (draft §3.2.4):
- *   1. Previous DKIM2-Signatures (i=1..N-1)               + CRLF
- *   2. Our DKIM2-Sig-mf (i=N)                             + CRLF
- *   3. Our DKIM2-Sig-rt (i=N, one per RCPT TO)            + CRLF
- *   4. ALL DKIM2-Mod with i<=N (from previous hops)        + CRLF
+ *   1. Previous DKIM2-Chain-Sigs (i=1..N-1)               + CRLF
+ *   2. Our DKIM2-Chain-mf (i=N)                             + CRLF
+ *   3. Our DKIM2-Chain-rt (i=N, one per RCPT TO)            + CRLF
+ *   4. ALL DKIM2-Chain-Mod with i<=N (from previous hops)        + CRLF
  *   5. Message headers listed in h=                        + CRLF
- *   6. Our DKIM2-Signature with b= empty                   NO CRLF
+ *   6. Our DKIM2-Chain-Sig with b= empty                   NO CRLF
  *
  * NOT signed: Received:, Return-Path:, trace headers.
  *
@@ -100,7 +100,7 @@ struct context
    /* Hop from verifier */
    char verifier_verdict[32];   /* pass/fail/none                         */
    int  internal_status_count;  /* count of Internal-Status headers seen   */
-   int  found_prev_sigs;        /* count of DKIM2-Signature in reservoir  */
+   int  found_prev_sigs;        /* count of DKIM2-Chain-Sig in reservoir  */
    int  max_prev_hop;           /* highest i= seen across ALL DKIM2 headers */
 
    /* Envelope */
@@ -591,22 +591,34 @@ static sfsistat dcs_header(SMFICTX *ctx, char *headerf, char *headerv)
    slot->fr = 0;
    slot->is_new = 0;
 
-   /* Classify DKIM2 headers */
-   if (strncasecmp(headerf, "DKIM2-", 6) == 0)
+   /* Classify our own chain headers.
+    *
+    * The gate matches the DKIM2-Chain- namespace only, never the bare
+    * DKIM2- prefix.  A DKIM2-Signature emitted by a DKIM2-core signer
+    * belongs to a different mechanism: it carries its own i= tag, and a
+    * wider gate would let that foreign index reach slot->hop while the
+    * slot stayed DC_HDR_OTHER.  Such headers are ordinary headers here.
+    *
+    * The hh= exclusion list is deliberately wider (see hh_default_excludes
+    * in dc_shared.c, which still carries "DKIM2-"): foreign chain headers
+    * accumulate one per hop, exactly like ARC-, so they must stay out of
+    * the header hash even though we never classify them.
+    */
+   if (strncasecmp(headerf, "DKIM2-Chain-", 12) == 0)
    {
       int hop = dc_get_hop_index(headerv);
       if (hop > 0)
       {
          slot->hop = hop;
 
-         if (strcasecmp(headerf, "DKIM2-Signature") == 0)
+         if (strcasecmp(headerf, "DKIM2-Chain-Sig") == 0)
          {
             slot->dc_type = DC_HDR_SIG;
             ps->found_prev_sigs++;
             if (hop > ps->max_prev_hop)
                ps->max_prev_hop = hop;
          }
-         else if (strcasecmp(headerf, "DKIM2-Mod") == 0)
+         else if (strcasecmp(headerf, "DKIM2-Chain-Mod") == 0)
          {
             slot->dc_type = DC_HDR_MOD;
             if (hop > ps->max_prev_hop)
@@ -622,7 +634,7 @@ static sfsistat dcs_header(SMFICTX *ctx, char *headerf, char *headerv)
             if (slot->seq == 0) slot->seq = 1;
             if (slot->fr == 0)  slot->fr = 1;
          }
-         else if (strcasecmp(headerf, "DKIM2-Authentication-Results") == 0)
+         else if (strcasecmp(headerf, "DKIM2-Chain-Results") == 0)
          {
             slot->dc_type = DC_HDR_AR;
          }
@@ -829,7 +841,7 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    else if (ps->verifier_verdict[0] == '\0' && ps->is_localhost == 1 && ps->max_prev_hop > 0)
    {
       /* Case B: local mailing list signing after DKIM-Mod.
-       * N = (highest DKIM2-Signature i=) + 1.  We derive this from
+       * N = (highest DKIM2-Chain-Sig i=) + 1.  We derive this from
        * dc_max_sig_hop() — the authoritative signature-only index — rather
        * than from found_prev_sigs (a count) or max_prev_hop (a max over
        * signatures AND Mods, which sits at N when the list's Mod is present).
@@ -842,19 +854,19 @@ static sfsistat dcs_eom(SMFICTX *ctx)
       if (max_sig < 0)
       {
          syslog(LOG_NOTICE,
-                "DCS_EOM: Case B — broken DKIM2-Signature chain; not signing");
+                "DCS_EOM: Case B — broken DKIM2-Chain-Sig chain; not signing");
          return SMFIS_CONTINUE;
       }
       N = max_sig + 1;
       generate_auth_result = 1;
 
-      /* Verdict: propagate from the DKIM2-Authentication-Results of the
+      /* Verdict: propagate from the DKIM2-Chain-Results of the
        * PREVIOUS hop, i.e. at i = N-1.  In Case B the prior AR was emitted
        * by the previous hop's verifier or signer, depending on geometry:
        * in full attestation mode (deployment profile Case 2) by the
        * pre-list signer at its own signing level (N-1); in the two-hop
        * mode (Case 1) by our own inbound verifier at max_hop+1 = N-1.
-       * The list manager then added a DKIM2-Mod at level N.  The anchor
+       * The list manager then added a DKIM2-Chain-Mod at level N.  The anchor
        * must be N-1, NOT max_prev_hop (which equals N when that Mod is
        * present) and NOT the highest i= among AR records (an unsigned,
        * injectable field).
@@ -881,7 +893,7 @@ static sfsistat dcs_eom(SMFICTX *ctx)
       for (int j = 0; j < ps->header_cnt; j++)
       {
          if (strcasecmp(ps->headers[j].name,
-                        "DKIM2-Authentication-Results") != 0)
+                        "DKIM2-Chain-Results") != 0)
             continue;
 
          if (dc_get_hop_index(ps->headers[j].value) != prev_hop)
@@ -915,7 +927,7 @@ static sfsistat dcs_eom(SMFICTX *ctx)
       else if (verdict_conflict)
       {
          syslog(LOG_NOTICE,
-                "DCS_EOM: Case B — conflicting DKIM2-Auth-Results at i=%d; "
+                "DCS_EOM: Case B — conflicting DKIM2-Chain-Results at i=%d; "
                 "propagating fail", prev_hop);
          prev_verdict = "fail";
       }
@@ -1130,15 +1142,15 @@ static sfsistat dcs_eom(SMFICTX *ctx)
    char *bh_b64 = encode_base64_hash(body_hash_bin, body_hash_len);
    if (!bh_b64) return SMFIS_TEMPFAIL;
 
-   /* ---- 2. BUILD DKIM2-Sig-mf ---- */
+   /* ---- 2. BUILD DKIM2-Chain-mf ---- */
    char mf_value[512];
    snprintf(mf_value, sizeof(mf_value), "i=%d; addr=%s", N, ps->envelope.mail_from);
 
-   /* ---- 3. BUILD DKIM2-Sig-rt (BCC-aware) ----
+   /* ---- 3. BUILD DKIM2-Chain-rt (BCC-aware) ----
     *
     * Only include RCPT TO addresses that appear in To: or Cc: headers.
     * Recipients not visible in those headers are BCC and MUST NOT
-    * appear in DKIM2-Sig-rt to prevent BCC disclosure.
+    * appear in DKIM2-Chain-rt to prevent BCC disclosure.
     */
 
    /* Step 3a: Extract visible addresses from To: and Cc: headers */
@@ -1200,7 +1212,7 @@ static sfsistat dcs_eom(SMFICTX *ctx)
          rt_indices[r] = r;
    }
 
-   /* Step 3c: Build DKIM2-Sig-rt headers */
+   /* Step 3c: Build DKIM2-Chain-rt headers */
    char (*rt_values)[512] = NULL;
    if (rt_count > 0)
    {
@@ -1220,7 +1232,7 @@ static sfsistat dcs_eom(SMFICTX *ctx)
       return SMFIS_TEMPFAIL;
    }
 
-   /* ---- 5. BUILD DKIM2-Signature (without b=) ---- */
+   /* ---- 5. BUILD DKIM2-Chain-Sig (without b=) ---- */
    long t_stamp = (long)time(NULL);
    /* Header canonicalization is always relaxed (draft Section 3.3.5); the body
     * part follows the -S process-wide choice. Must match the canonicalization
@@ -1253,23 +1265,23 @@ static sfsistat dcs_eom(SMFICTX *ctx)
       }                                                                    \
    } while(0)
 
-   /* a) All DKIM2-Authentication-Results i=1..N ascending */
+   /* a) All DKIM2-Chain-Results i=1..N ascending */
    for (int i = 1; i <= N; i++)
       for (int j = 0; j < ps->header_cnt; j++)
          if (ps->headers[j].dc_type == DC_HDR_AR && ps->headers[j].hop == i)
             APPEND_CANON(ps->headers[j].name, ps->headers[j].value, 1);
    /* Include our own auth result if generated (Case B/C) */
    if (generate_auth_result)
-      APPEND_CANON("DKIM2-Authentication-Results", auth_result_value, 1);
+      APPEND_CANON("DKIM2-Chain-Results", auth_result_value, 1);
 
-   /* b) Our DKIM2-Sig-mf (i=N only) */
-   APPEND_CANON("DKIM2-Sig-mf", mf_value, 1);
+   /* b) Our DKIM2-Chain-mf (i=N only) */
+   APPEND_CANON("DKIM2-Chain-mf", mf_value, 1);
 
-   /* c) Our DKIM2-Sig-rt (i=N only) */
+   /* c) Our DKIM2-Chain-rt (i=N only) */
    for (int r = 0; r < rt_count; r++)
-      APPEND_CANON("DKIM2-Sig-rt", rt_values[r], 1);
+      APPEND_CANON("DKIM2-Chain-rt", rt_values[r], 1);
 
-   /* d) ALL DKIM2-Mod with i<=N, canonical order */
+   /* d) ALL DKIM2-Chain-Mod with i<=N, canonical order */
    {
       struct header_slot *mod_ptrs[DC_MAX_MOD];
       int mod_count = 0;
@@ -1308,14 +1320,14 @@ static sfsistat dcs_eom(SMFICTX *ctx)
               ps->headers[j].used_for_signature = 1; break; }
    }
 
-   /* f) Previous DKIM2-Signatures i=1..N-1 ascending */
+   /* f) Previous DKIM2-Chain-Sigs i=1..N-1 ascending */
    for (int i = 1; i < N; i++)
       for (int j = 0; j < ps->header_cnt; j++)
          if (ps->headers[j].dc_type == DC_HDR_SIG && ps->headers[j].hop == i)
          { APPEND_CANON(ps->headers[j].name, ps->headers[j].value, 1); break; }
 
-   /* g) Our DKIM2-Signature with b= empty, NO CRLF */
-   APPEND_CANON("DKIM2-Signature", sig_value_no_b, 0);
+   /* g) Our DKIM2-Chain-Sig with b= empty, NO CRLF */
+   APPEND_CANON("DKIM2-Chain-Sig", sig_value_no_b, 0);
    #undef APPEND_CANON
 
    size_t sign_len = (size_t)(bp - sign_buf);
@@ -1424,19 +1436,19 @@ static sfsistat dcs_eom(SMFICTX *ctx)
       return SMFIS_TEMPFAIL;
    }
 
-   /* DKIM2-Authentication-Results (only for locally originated, Case 2) */
+   /* DKIM2-Chain-Results (only for locally originated, Case 2) */
    if (generate_auth_result)
    {
-      smfi_addheader(ctx, "DKIM2-Authentication-Results", auth_result_value);
+      smfi_addheader(ctx, "DKIM2-Chain-Results", auth_result_value);
    }
 
    char sig_full[4096];
    snprintf(sig_full, sizeof(sig_full), "%s%s", sig_value_no_b, b64_signature);
-   smfi_addheader(ctx, "DKIM2-Signature", sig_full);
-   smfi_addheader(ctx, "DKIM2-Sig-mf", mf_value);
+   smfi_addheader(ctx, "DKIM2-Chain-Sig", sig_full);
+   smfi_addheader(ctx, "DKIM2-Chain-mf", mf_value);
    for (int r = 0; r < rt_count; r++)
    {
-      smfi_addheader(ctx, "DKIM2-Sig-rt", rt_values[r]);
+      smfi_addheader(ctx, "DKIM2-Chain-rt", rt_values[r]);
    }
 
    char xsigned[100] = "";
@@ -1539,6 +1551,11 @@ void cleanup_and_exit(int sig)
 
 int main(int argc, char *argv[])
 {
+   /* Pin the C locale — see the matching comment in DarkChain.c.  The
+    * signer computes the same canonical form as the verifier, so it must
+    * make the same guarantee about ctype semantics. */
+   setlocale(LC_ALL, "C");
+
    tzset();
 
    int i_get = 0, i_ret = 0;
