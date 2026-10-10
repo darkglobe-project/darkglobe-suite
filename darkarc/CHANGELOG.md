@@ -1,4 +1,24 @@
-# Changelog DarkChain / DarkChains (DKIM2)
+# Changelog DarkARC 
+
+## [1.3 - 10/10/2026]
+
+### Fixed
+
+- **C locale pinned.** Both milters now call `setlocale(LC_ALL, "C")` at
+  the top of main. Header canonicalization and address comparison rely on
+  ctype and strcase* behaving as pure ASCII; under a single-byte LC_CTYPE
+  those routines classify octets >= 0x80 and would case-fold or collapse
+  continuation bytes of a UTF-8 sequence, corrupting the AMS and AS hashes
+  on legitimate mail. Nothing called setlocale before, so the processes
+  already ran in "C" — this makes it a decision rather than an accident.
+
+- **Folding definition aligned (via libdark).** `unfold_header()` used
+  `isspace()` to decide what constitutes a fold, which also accepts VT, FF,
+  CR and LF, while `canonicalize_header_relaxed()` tests SP and HTAB
+  explicitly. Both now use `dark_is_wsp()`, matching RFC 5234 WSP and
+  RFC 5322 folding. The change lives in libdark and is shared with
+  DarkChain / DarkChains.
+
 
 ## [1.2 - 21/07/2026]
 

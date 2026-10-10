@@ -24,6 +24,11 @@
 #define ARCS_HEADER_BUF   8192
 #define ARCS_BODY_CHUNK   4096
 
+/* Suite version, stamped into the X-Signed trace header.  Single point of
+ * change: it was a string literal at the smfi_addheader call site, which is
+ * how a release ends up advertising a version it is not. */
+#define DARC_VERSION      "1.3"
+
 /* DarkARCs-specific configuration */
 #define MY_SERVER         "dns.itb.it"
 #define DOMAIN            "itb.it"
@@ -772,7 +777,7 @@ sfsistat das_eom(SMFICTX *ctx)
                         sizeof("ARC-Seal: ") - 1);
       smfi_addheader(ctx, "ARC-Seal", as_folded);
       if (!ps_context->has_darc_xsigned)
-         smfi_addheader(ctx, "X-Signed", "DarkARC v1.2");
+         smfi_addheader(ctx, "X-Signed", "DarkARC v" DARC_VERSION);
    }
    return SMFIS_CONTINUE;
 }
@@ -954,8 +959,13 @@ sfsistat das_envfrom(SMFICTX *ctx, char **argv)
    return SMFIS_CONTINUE;
 }
 
-int main(int argc, char *argv[]) 
+int main(int argc, char *argv[])
 {
+   /* Pin the C locale — see the matching comment in DarkARC.c.  The signer
+    * computes the same canonical form as the verifier, so it must make the
+    * same guarantee about ctype semantics. */
+   setlocale(LC_ALL, "C");
+
    tzset();
    int i_get=0, i_ret=0;
    const char *pc_ofile = NULL;

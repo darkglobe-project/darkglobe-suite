@@ -1816,6 +1816,15 @@ sfsistat da_envfrom(SMFICTX *ctx, char **argv)
 
 int main(int argc, char *argv[])
 {
+   /* Pin the C locale.  Canonicalization and address comparison rely on
+    * ctype and strcase* behaving as pure ASCII: under a single-byte
+    * LC_CTYPE those routines classify octets >= 0x80, which would
+    * case-fold or collapse continuation bytes of a UTF-8 sequence and
+    * silently corrupt the hash on legitimate mail.  Nothing here calls
+    * setlocale otherwise, so the process already runs in "C" — this makes
+    * that a decision rather than an accident. */
+   setlocale(LC_ALL, "C");
+
    tzset();
    int i_get=0, i_ret=0;
    const char *pc_ofile = NULL;
