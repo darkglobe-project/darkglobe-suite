@@ -21,6 +21,16 @@ int hh_exclude_count = 0;
 struct dc_hh_exclude hh_includes[DC_HH_MAX_INCLUDE];
 int hh_include_count = 0;
 
+/* Structural exclusions from the header hash.  These are compiled in, not
+ * configurable: hh_exclude.conf only adds to this list.
+ *
+ * "DKIM2-" is deliberately wider than the DKIM2-Chain- namespace the two
+ * milters classify.  A DKIM2-Signature emitted by a DKIM2-core signer is a
+ * foreign header we never index, but it still accumulates one per hop, just
+ * like ARC-, so hashing it would make hh= change under our feet and break
+ * rollback at the next hop.  Narrowing this entry to DKIM2-Chain- would
+ * reintroduce exactly that failure.
+ */
 const char *hh_default_excludes[] = {
    "Received", "Return-Path", "Authentication-Results",
    "DKIM-Signature", "DKIM2-", "ARC-", NULL
@@ -103,20 +113,20 @@ int dc_get_hop_index(const char *header_value)
 }
 
 /*
- * Highest i= among DKIM2-Signature headers only.
+ * Highest i= among DKIM2-Chain-Sig headers only.
  *
- * Per the deployment profile, DKIM2-Signature headers are numbered
+ * Per the deployment profile, DKIM2-Chain-Sig headers are numbered
  * sequentially starting at i=1 and a gap MUST be treated as making the
  * message unsigned.  Given that rule, the highest signature index equals
  * the signature count, and (highest + 1) is the authoritative index for
- * the next signing hop — independent of any DKIM2-Mod present (which may
+ * the next signing hop — independent of any DKIM2-Chain-Mod present (which may
  * sit at the next level and would inflate a max taken over all headers).
  *
  * The inbound verifier already validates chain continuity in dc_eoh; this
  * function carries its own lightweight contiguity pass because it is also
  * called by the outbound signer in the post-list (Case B) path, where the
  * verifier did not run.  On a gap it logs and returns -1 so the caller can
- * treat the chain as unsigned.  Returns 0 when no DKIM2-Signature exists.
+ * treat the chain as unsigned.  Returns 0 when no DKIM2-Chain-Sig exists.
  *
  * Reads the already-parsed dc_type/hop fields directly — no re-parsing.
  */
@@ -145,7 +155,7 @@ int dc_max_sig_hop(const struct header_slot *headers, int header_cnt)
       if (!found)
       {
          syslog(LOG_NOTICE,
-                "dc_max_sig_hop: chain gap — no DKIM2-Signature at i=%d "
+                "dc_max_sig_hop: chain gap — no DKIM2-Chain-Sig at i=%d "
                 "(max=%d); treating chain as unsigned", i, max_i);
          return -1;
       }
@@ -208,7 +218,7 @@ void dc_get_tag_str(const char *header_value, const char *tag,
  * ================================================================ */
 
 /*
- * Extract addr= tag from a DKIM2-Sig-mf or DKIM2-Sig-rt header.
+ * Extract addr= tag from a DKIM2-Chain-mf or DKIM2-Chain-rt header.
  * Quote-aware: does not stop at ';' inside a quoted local part.
  * addr= is defined as the last tag, so take everything remaining.
  */
@@ -605,7 +615,7 @@ int cmp_canon_value_q(const void *a, const void *b)
    return cmp_canon_value(sa, sb);
 }
 
-/* DKIM2-Mod canonical order: i asc, seq asc, del<new, fr asc */
+/* DKIM2-Chain-Mod canonical order: i asc, seq asc, del<new, fr asc */
 int cmp_mod_canonical(const void *a, const void *b)
 {
    const struct header_slot *sa = *(const struct header_slot *const *)a;
@@ -619,7 +629,7 @@ int cmp_mod_canonical(const void *a, const void *b)
    return 0;
 }
 
-/* DKIM2-Sig-rt: ascending v= */
+/* DKIM2-Chain-rt: ascending v= */
 int cmp_rt_by_v(const void *a, const void *b)
 {
    const struct header_slot *sa = *(const struct header_slot *const *)a;
@@ -639,7 +649,7 @@ int cmp_rt_by_v(const void *a, const void *b)
  * 2. Sort alphabetically by name
  * 3. For duplicate groups:
  *    - Multi-allowed (Comments, Keywords, Resent-*): sort by canon value
- *    - All others: reorder using DKIM2-Mod i=
+ *    - All others: reorder using DKIM2-Chain-Mod i=
  * 4. Canonicalize each, concatenate, SHA-256
  *
  * Returns malloc'd base64 string, or NULL on error. Caller frees.
@@ -662,7 +672,7 @@ char *dc_compute_hh(struct header_slot *headers, int header_cnt)
    if (count > 1)
       qsort(ptrs, count, sizeof(struct header_slot *), cmp_header_hh);
 
-   /* Precompute DKIM2-Mod candidates (new=, fr=1) once: field name,
+   /* Precompute DKIM2-Chain-Mod candidates (new=, fr=1) once: field name,
     * new= value start and end.  Header values are immutable during this
     * function, so the extraction never changes across group members —
     * this replaces the former O(group_members x header_cnt) rescan in
@@ -690,7 +700,7 @@ char *dc_compute_hh(struct header_slot *headers, int header_cnt)
       if (mods_cnt >= DC_MAX_MOD)
       {
          syslog(LOG_NOTICE,
-                "DC_SHARED: dc_compute_hh: DKIM2-Mod candidates exceed %d, "
+                "DC_SHARED: dc_compute_hh: DKIM2-Chain-Mod candidates exceed %d, "
                 "extra Mods ignored for duplicate-group reordering",
                 DC_MAX_MOD);
          break;
@@ -717,7 +727,7 @@ char *dc_compute_hh(struct header_slot *headers, int header_cnt)
       mods_cnt++;
    }
 
-   /* Reorder duplicate groups using DKIM2-Mod */
+   /* Reorder duplicate groups using DKIM2-Chain-Mod */
    int grp_start = 0;
    while (grp_start < count)
    {
@@ -730,7 +740,7 @@ char *dc_compute_hh(struct header_slot *headers, int header_cnt)
 
       if (grp_size > 1)
       {
-         /* Step A: For ALL members, try to find a matching DKIM2-Mod (new=) */
+         /* Step A: For ALL members, try to find a matching DKIM2-Chain-Mod (new=) */
          static __thread int sort_keys[MAX_HEADER_COUNT];
 
          for (int g = grp_start; g < grp_end; g++)

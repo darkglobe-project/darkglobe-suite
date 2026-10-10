@@ -18,11 +18,11 @@
  * ================================================================ */
 
 #define DC_MAX_HOPS          15     /* Maximum i= value                      */
-#define DC_VERSION           "1.0"  /* DarkChain suite version               */
+#define DC_VERSION           "2.0"  /* DarkChain suite version               */
 #define DC_MAX_RT           500     /* Maximum RCPT TO per hop               */
-#define DC_MAX_SEQ           20     /* Maximum seq= per hop for DKIM2-Mod    */
+#define DC_MAX_SEQ           20     /* Maximum seq= per hop for DKIM2-Chain-Mod    */
 #define DC_MAX_FR             2     /* Maximum fr= frames per Mod entry      */
-#define DC_MAX_MOD          400     /* Maximum DKIM2-Mod headers in hop index */
+#define DC_MAX_MOD          400     /* Maximum DKIM2-Chain-Mod headers in hop index */
 #define DC_MAX_ADDR         256     /* Max length of an addr-spec            */
 #define DC_MAX_EXTRACTED     64     /* Max addresses extracted from To:/Cc:  */
 #define DC_RCPT_INITIAL      16     /* Starting allocation for rcpt_to       */
@@ -40,11 +40,11 @@
  * ================================================================ */
 
 #define DC_HDR_OTHER          0     /* Any non-DKIM2 header                  */
-#define DC_HDR_SIG            1     /* DKIM2-Signature                       */
-#define DC_HDR_MF             2     /* DKIM2-Sig-mf                          */
-#define DC_HDR_RT             3     /* DKIM2-Sig-rt                          */
-#define DC_HDR_MOD            4     /* DKIM2-Mod                             */
-#define DC_HDR_AR             5     /* DKIM2-Authentication-Results          */
+#define DC_HDR_SIG            1     /* DKIM2-Chain-Sig                       */
+#define DC_HDR_MF             2     /* DKIM2-Chain-mf                          */
+#define DC_HDR_RT             3     /* DKIM2-Chain-rt                          */
+#define DC_HDR_MOD            4     /* DKIM2-Chain-Mod                             */
+#define DC_HDR_AR             5     /* DKIM2-Chain-Results          */
 
 /* ================================================================
  * DATA STRUCTURES
@@ -60,10 +60,10 @@ struct header_slot
    int  used_for_signature;     /* Flag: already consumed by h= walk     */
    int  dc_type;                /* DC_HDR_* code, 0 for non-DKIM2        */
    int  hop;                    /* i= value, 0 if not DKIM2              */
-   int  v;                      /* v= for DKIM2-Sig-rt, 0 otherwise      */
-   int  seq;                    /* seq= for DKIM2-Mod, 0 otherwise       */
-   int  fr;                     /* fr= for DKIM2-Mod, 0 otherwise (1-based) */
-   int  is_new;                 /* 1 if DKIM2-Mod with new=, 0 if del=   */
+   int  v;                      /* v= for DKIM2-Chain-rt, 0 otherwise      */
+   int  seq;                    /* seq= for DKIM2-Chain-Mod, 0 otherwise       */
+   int  fr;                     /* fr= for DKIM2-Chain-Mod, 0 otherwise (1-based) */
+   int  is_new;                 /* 1 if DKIM2-Chain-Mod with new=, 0 if del=   */
 };
 
 /*
@@ -97,7 +97,7 @@ int  dc_get_tag_int(const char *header_value, const char *tag);
 void dc_get_tag_str(const char *header_value, const char *tag,
                     char *out, size_t out_len);
 
-/* Highest i= among DKIM2-Signature headers only (0 if none, -1 on a
+/* Highest i= among DKIM2-Chain-Sig headers only (0 if none, -1 on a
  * chain gap).  Authoritative source for the next signing hop index,
  * grounded in the spec's contiguous-chain rule. */
 int  dc_max_sig_hop(const struct header_slot *headers, int header_cnt);
