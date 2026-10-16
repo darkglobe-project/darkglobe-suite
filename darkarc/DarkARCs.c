@@ -27,7 +27,7 @@
 /* Suite version, stamped into the X-Signed trace header.  Single point of
  * change: it was a string literal at the smfi_addheader call site, which is
  * how a release ends up advertising a version it is not. */
-#define DARC_VERSION      "1.3"
+#define DARC_VERSION      "1.4"
 
 /* DarkARCs-specific configuration */
 #define MY_SERVER         "dns.itb.it"
