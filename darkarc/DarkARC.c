@@ -414,6 +414,18 @@ sfsistat da_header(SMFICTX *ctx, char *headerf, char *headerv)
          return SMFIS_CONTINUE;
       }
    }
+   /* The reservoir is allocated per connection and must be here.  If it
+    * is not, header_capacity would still read as non-zero and the guard
+    * below would wave us through to write at headers[header_cnt], which
+    * is how the 2026-10-11 crash happened.  Fail the message instead of
+    * the process. */
+   if (ps_context->headers == NULL)
+   {
+      syslog(LOG_ERR, "DA_HEADER: header reservoir unallocated (capacity=%d) — tempfail",
+             ps_context->header_capacity);
+      return SMFIS_TEMPFAIL;
+   }
+
    // If current maximum capacity reached, expand
    if (ps_context->header_cnt >= ps_context->header_capacity)
    {
@@ -1708,14 +1720,125 @@ sfsistat da_begin(SMFICTX *ctx)
 }
 
 
+static void da_reset_message(struct context *priv)
+{
+   /* Per-message reset.
+    *
+    * Allocation is per connection: da_connect creates the header
+    * reservoir and the three digest contexts, and they must outlive the
+    * single message.  Everything else in struct context describes one
+    * message and must not reach the next one on a reused connection.
+    *
+    * The reset zeroes the whole structure and restores the keep-list
+    * rather than clearing fields one by one.  That inverts the default:
+    * a field added to struct context later is cleared automatically and
+    * has to be named here to survive.  The two hand-written branches this
+    * replaces each forgot a different set, among them header_vfy and
+    * seal_vfy, so a second message on a reused connection could inherit
+    * the previous message's verification verdict.
+    *
+    * The preservation is shallow by design: for headers and the three
+    * contexts only the pointer is saved, so the memory they address is
+    * untouched.  helo is an array inside the structure, not a pointer, so
+    * it needs a real copy.
+    */
+   struct header_slot *k_headers  = priv->headers;
+   int                 k_capacity = priv->header_capacity;
+   EVP_MD_CTX         *k_hdr      = priv->mdctx_header;
+   EVP_MD_CTX         *k_bsimple  = priv->mdctx_body_simple;
+   EVP_MD_CTX         *k_brelaxed = priv->mdctx_body_relaxed;
+   int                 k_local    = priv->is_localhost;
+   int                 k_msgcnt   = priv->msg_count;
+   char                k_helo[MAXHOST];
+
+   securecpy(k_helo, priv->helo, sizeof(k_helo));
+
+   memset(priv, 0, sizeof(*priv));
+
+   priv->headers            = k_headers;
+   priv->header_capacity    = k_capacity;
+   priv->mdctx_header       = k_hdr;
+   priv->mdctx_body_simple  = k_bsimple;
+   priv->mdctx_body_relaxed = k_brelaxed;
+   priv->is_localhost       = k_local;
+   priv->msg_count          = k_msgcnt;
+
+   securecpy(priv->helo, k_helo, sizeof(priv->helo));
+
+   /* The slots live outside the structure, so memset did not reach them.
+    * header_capacity is the current size, which da_header may have grown
+    * past MAX_CAPACITY: clearing MAX_CAPACITY slots would leave the tail
+    * dirty. */
+   for (int i = 0; i < priv->header_capacity; i++)
+   {
+      priv->headers[i].name[0]  = '\0';
+      priv->headers[i].value[0] = '\0';
+      priv->headers[i].arc_index = 0;
+      priv->headers[i].used_for_signature = 0;
+   }
+
+   EVP_MD_CTX_reset(priv->mdctx_header);
+   EVP_MD_CTX_reset(priv->mdctx_body_simple);
+   EVP_MD_CTX_reset(priv->mdctx_body_relaxed);
+}
+
+
 sfsistat da_envfrom(SMFICTX *ctx, char **argv)
 {
-   // 1. Retrieve the private structure
    struct context *priv = (struct context *)smfi_getpriv(ctx);
 
+   if (priv == NULL)
+   {
+      syslog(LOG_ERR, "DA_ENVFROM: no private context");
+      return SMFIS_TEMPFAIL;
+   }
+
+   priv->msg_count++;
+
+   /* Allocation belongs to the connection, but a defensive check costs
+    * nothing and turns a null dereference into a tempfail.  This is what
+    * the crash of 2026-10-11 went through: an abort had freed the
+    * reservoir while header_capacity kept its value, so da_header skipped
+    * its realloc guard and wrote through a null pointer. */
+   if (priv->headers == NULL)
+   {
+      priv->header_capacity = MAX_CAPACITY;
+      priv->headers = calloc(priv->header_capacity,
+                             sizeof(struct header_slot));
+      if (priv->headers == NULL)
+      {
+         syslog(LOG_ERR, "DA_ENVFROM: header reservoir allocation failed");
+         priv->header_capacity = 0;
+         return SMFIS_TEMPFAIL;
+      }
+   }
+
+   if (priv->mdctx_header == NULL)
+      priv->mdctx_header = EVP_MD_CTX_new();
+   if (priv->mdctx_body_simple == NULL)
+      priv->mdctx_body_simple = EVP_MD_CTX_new();
+   if (priv->mdctx_body_relaxed == NULL)
+      priv->mdctx_body_relaxed = EVP_MD_CTX_new();
+
+   if (priv->mdctx_header == NULL || priv->mdctx_body_simple == NULL ||
+       priv->mdctx_body_relaxed == NULL)
+   {
+      syslog(LOG_ERR, "DA_ENVFROM: digest context allocation failed");
+      return SMFIS_TEMPFAIL;
+   }
+
+   da_reset_message(priv);
+
+   if (EVP_DigestInit_ex(priv->mdctx_header, EVP_sha256(), NULL) != 1 ||
+       EVP_DigestInit_ex(priv->mdctx_body_simple, EVP_sha256(), NULL) != 1 ||
+       EVP_DigestInit_ex(priv->mdctx_body_relaxed, EVP_sha256(), NULL) != 1)
+   {
+      syslog(LOG_ERR, "DA_ENVFROM: EVP_DigestInit_ex failed");
+      return SMFIS_TEMPFAIL;
+   }
+
+   /* After the reset, so it is not wiped. */
    clock_gettime(CLOCK_MONOTONIC, &priv->start_time);
-
-
 
    if (argv[0] != NULL)
    {
@@ -1723,7 +1846,6 @@ sfsistat da_envfrom(SMFICTX *ctx, char **argv)
       if (p)
       {
          strncpy(priv->spf_id, p + 1, sizeof(priv->spf_id) - 1);
-         // Clean up eventuale '>' finale
          char *end = strchr(priv->spf_id, '>');
          if (end) *end = '\0';
       }
@@ -1732,83 +1854,6 @@ sfsistat da_envfrom(SMFICTX *ctx, char **argv)
          strncpy(priv->spf_id, argv[0], sizeof(priv->spf_id) - 1);
       }
    }
-   priv->msg_count++;
-
-   // 2. First mail on this connection: allocate
-   if (priv->msg_count == 1)
-   {
-
-      // Allocate the header reservoir (es. 256 slot)
-      priv->header_capacity = MAX_CAPACITY;
-
-      priv->h_num_fields = 0;            // number of fields to hash or buffer for signature verification
-      priv->pending_newlines_relaxed=0;
-      priv->body_has_content_relaxed=0;
-      priv->pending_newlines_simple=0;
-      priv->body_size = 0;
-      priv->body_has_content_simple=0;
-      priv->is_start_of_line=0;
-      priv->header_cnt = 0;
-      priv->p_had_space=0;
-      memset(priv->spf_res, 0, sizeof(priv->spf_res));
-      memset(priv->dmarc_res, 0, sizeof(priv->dmarc_res));        // return SMFIS_CONTINUE;
-      priv->found_arc = 0;
-      priv->arc_struct_fail = 0;
-      priv->arc_struct_reason[0] = '\0';
-      priv->seen_aar = priv->seen_ams = priv->seen_as = 0;
-
-
-      return SMFIS_CONTINUE;
-   }
-   else
-   { 
-      // 3. Not NULL: connection is being reused (RSET).
-      // Reset previous mail data without freeing everything.
-      EVP_MD_CTX_reset(priv->mdctx_body_relaxed);
-      EVP_MD_CTX_reset(priv->mdctx_body_simple);
-      EVP_MD_CTX_reset(priv->mdctx_header);
-      // 4. Initialize SHA-256 for the new message
-      if (EVP_DigestInit_ex(priv->mdctx_header, EVP_sha256(), NULL) != 1)
-      {
-         return SMFIS_TEMPFAIL;
-      }
-
-      if (EVP_DigestInit_ex(priv->mdctx_body_simple, EVP_sha256(), NULL) != 1)
-      {
-         return SMFIS_TEMPFAIL;
-      }
-      if (EVP_DigestInit_ex(priv->mdctx_body_relaxed, EVP_sha256(), NULL) != 1)
-      {
-         return SMFIS_TEMPFAIL;
-      }
-
-      priv->header_cnt = 0;
-      priv->found_arc = 0;
-      priv->arc_struct_fail = 0;
-      priv->arc_struct_reason[0] = '\0';
-      priv->seen_aar = priv->seen_ams = priv->seen_as = 0;
-      priv->pending_newlines_simple=0;
-      priv->body_has_content_simple=0;
-      priv->body_size = 0;
-      priv->pending_newlines_relaxed=0;
-      priv->body_has_content_relaxed=0;
-      priv->is_start_of_line=0;
-      memset (priv->body_hash, '\0', EVP_MAX_MD_SIZE);
-      priv->body_hash_len=0;
-      priv->p_had_space=0;
-
-      // memset(priv->history, 0, sizeof(priv->history));
-      // Reset the 'used' flag for every slot in the reservoir
-      for(int i=0; i < priv->header_capacity; i++)
-      {
-         priv->headers[i].name[0]=0;
-         priv->headers[i].value[0]=0;
-         priv->headers[i].arc_index=0;
-         priv->headers[i].used_for_signature = 0;
-         // If you used strdup for values, free() them here
-      }
-   }
-
 
    return SMFIS_CONTINUE;
 }
@@ -1934,37 +1979,32 @@ int main(int argc, char *argv[])
    return (i_ret);
 }
 
-// Helper function
-void cleanup_session(SMFICTX *ctx)
-{
-   struct context *priv = (struct context *)smfi_getpriv(ctx);
-   if (priv != NULL)
-   {
-      // 1. Free the header reservoir
-      if (priv->headers)
-      {
-         free(priv->headers);
-      }
-
-      // 2. Free the OpenSSL context
-      if (priv->mdctx_body_simple) EVP_MD_CTX_free(priv->mdctx_body_simple);
-      if (priv->mdctx_body_relaxed) EVP_MD_CTX_free(priv->mdctx_body_relaxed);
-      if (priv->mdctx_header) EVP_MD_CTX_free(priv->mdctx_header);
-
-      // 3. Critical: null out the pointer in the milter context
-      smfi_setpriv(ctx, NULL);
-
-      // 4. Free the main structure
-      free(priv);
-   }
-}
-
 sfsistat da_abort(SMFICTX *ctx)
 {
+   /* The transaction is cancelled but the connection stays open, and the
+    * next message reuses the reservoir and the digest contexts, which are
+    * allocated once in da_connect.  Nothing is freed here.
+    *
+    * Calling cleanup_message() instead left headers == NULL while
+    * header_capacity kept its value: da_header then found header_cnt
+    * below capacity, skipped the realloc, and wrote through the null
+    * pointer.  That is the crash of 2026-10-11, on the DSN that follows a
+    * rejected recipient inside the same connection.
+    *
+    * msg_count is deliberately untouched.  cleanup_message() used to
+    * reset it to 0, which sent the next envfrom down the "first message"
+    * path and defeated the only guard the code had.
+    *
+    * Only the crypto state is dropped, so the aborted message's bytes
+    * cannot pollute the next digest.  da_envfrom re-runs DigestInit on
+    * every message anyway; this keeps the contexts clean in between.
+    * Mirrors cleanup_session(ctx, false) in DarkARCs. */
    struct context *priv = (struct context *)smfi_getpriv(ctx);
    if (priv != NULL)
    {
-      cleanup_message(priv); // Clean up the message but keep 'priv' alive
+      if (priv->mdctx_body_simple)  EVP_MD_CTX_reset(priv->mdctx_body_simple);
+      if (priv->mdctx_body_relaxed) EVP_MD_CTX_reset(priv->mdctx_body_relaxed);
+      if (priv->mdctx_header)       EVP_MD_CTX_reset(priv->mdctx_header);
    }
    return SMFIS_CONTINUE;
 }
@@ -2068,6 +2108,18 @@ sfsistat da_connect(SMFICTX *ctx, char *hostname, _SOCK_ADDR *hostaddr)
 
    // Allocate the header reservoir
    ps_context->headers = calloc(ps_context->header_capacity, sizeof(struct header_slot));
+   if (ps_context->headers == NULL)
+   {
+      /* Unchecked before: on allocation failure the first message hit the
+       * same null dereference as the post-abort path. */
+      syslog(LOG_ERR, "DA_CONNECT: header reservoir allocation failed");
+      if (ps_context->mdctx_header)       EVP_MD_CTX_free(ps_context->mdctx_header);
+      if (ps_context->mdctx_body_simple)  EVP_MD_CTX_free(ps_context->mdctx_body_simple);
+      if (ps_context->mdctx_body_relaxed) EVP_MD_CTX_free(ps_context->mdctx_body_relaxed);
+      smfi_setpriv(ctx, NULL);
+      free(ps_context);
+      return SMFIS_TEMPFAIL;
+   }
    ps_context->is_localhost = 0; // Default: traffico esterno
 
 
