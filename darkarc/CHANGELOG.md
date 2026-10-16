@@ -1,5 +1,28 @@
 # Changelog DarkARC 
 
+## [1.4 - 16/10/2026]
+
+### Changed
+
+- **Per-message state consolidated.** The verifier's per-message reset is now
+  a single `da_reset_message()`, called from `da_envfrom` on every message.
+  Allocation remains per connection as before: the header reservoir and the
+  three digest contexts are created in `da_connect` and outlive the single
+  message. The reset clears the context structure and restores the
+  per-connection fields, so a field added to the structure later is cleared
+  by default instead of by hand. This also stops the per-message timing
+  counters from accumulating across a connection.
+
+- **Transaction abort aligned with DarkARCs.** `da_abort` resets the digest
+  state and leaves the per-connection buffers in place, matching
+  `cleanup_session(ctx, false)` in the signer. The two milters now handle a
+  cancelled transaction the same way.
+
+- **Allocation checks.** The reservoir allocation in `da_connect` is checked,
+  and `da_header` verifies the reservoir before writing to it. The unused
+  `cleanup_session()` helper is removed.
+
+
 ## [1.3 - 10/10/2026]
 
 ### Fixed
